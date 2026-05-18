@@ -47,19 +47,30 @@ cd skills
   pip install -r requirements.txt
   ```
 
-#### 3. Make sure the target directory exists
+#### 3. Drop in third-party assets (analyze-nv-bug-report only)
+
+`analyze-nv-bug-report` shells out to NVIDIA's Xid decoder, which is **not** committed to this repo. Before syncing the skill, place the two assets below into `analyze-nv-bug-report/scripts/third_party/`:
+
+| File | Source |
+|---|---|
+| `nvidia_xid_analyzer.py` | NVIDIA Xid analyzer bundle |
+| `Server-RAS-Catalog.xlsx` | NVIDIA Xid analyzer bundle |
+
+Details (provenance, redistribution policy, sanity-check snippet) live in [`analyze-nv-bug-report/scripts/third_party/README.md`](analyze-nv-bug-report/scripts/third_party/README.md). If you skip this step, the skill still runs, but section §7.2 (Xid Detailed Decode) of the report will be skipped with a "Required assets missing" warning.
+
+#### 4. Make sure the target directory exists
 
 ```bash
 mkdir -p ~/.cursor/skills
 ```
 
-#### 4. Sync the skill directory with `rsync -aPp`
+#### 5. Sync the skill directory with `rsync -aPp`
 
 ```bash
 rsync -aPp ./<skill-name> ~/.cursor/skills/
 ```
 
-#### 5. Verify in Cursor / Claude Code
+#### 6. Verify in Cursor / Claude Code
 
 Open Cursor, start a new chat, and prompt something matching the skill's description (e.g. "analyze this nv-bug-report.log"). The agent will load the skill and follow its `SKILL.md` workflow.
 
@@ -75,15 +86,23 @@ cd ~/repos/skills
 # 2. Install Python dependencies
 pip install -r requirements.txt
 
-# 3. Prepare skills root
+# 3. Drop in NVIDIA Xid analyzer assets (see analyze-nv-bug-report/scripts/third_party/README.md)
+#    Required: nvidia_xid_analyzer.py  Server-RAS-Catalog.xlsx
+cp /path/to/extracted/nvidia_xid_analyzer.py    analyze-nv-bug-report/scripts/third_party/
+cp /path/to/extracted/Server-RAS-Catalog.xlsx   analyze-nv-bug-report/scripts/third_party/
+
+# 4. Prepare skills root
 mkdir -p ~/.cursor/skills
 
-# 4. Sync the skill
+# 5. Sync the skill
 rsync -aPp ./analyze-nv-bug-report ~/.cursor/skills/
 
-# 5. Verify the install
+# 6. Verify the install
 ls ~/.cursor/skills/analyze-nv-bug-report/
 # Expect:  SKILL.md  scripts/
+
+ls ~/.cursor/skills/analyze-nv-bug-report/scripts/third_party/
+# Expect:  README.md  nvidia_xid_analyzer.py  Server-RAS-Catalog.xlsx
 
 cat ~/.cursor/skills/analyze-nv-bug-report/SKILL.md | head -5
 # Expect frontmatter:
