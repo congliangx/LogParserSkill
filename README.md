@@ -1,0 +1,110 @@
+# skills
+
+A collection of custom Agent Skills for Cursor / Claude Code. Each top-level subdirectory is a self-contained skill; the directory name is the skill name.
+
+## Repository layout
+
+```
+skills/
+├── README.md                         # This file
+├── requirements.txt                  # Python deps for bundled scripts
+├── analyze-nv-bug-report/            # Parse nvidia-bug-report.sh logs (ready)
+│   ├── SKILL.md
+│   └── scripts/
+├── analyze-nvosdump/                 # Placeholder, WIP
+├── analyze-partnerdiag/              # Placeholder, WIP
+└── doc/                              # Per-skill structure / design docs
+    └── analyze-nv-bug-report-structure.md
+```
+
+## Available skills
+
+| Name | Purpose |
+|---|---|
+| [`analyze-nv-bug-report`](analyze-nv-bug-report/) | Analyze NVIDIA `nvidia-bug-report.sh` log files — extract GPU status, Xid errors, NVLink / IMEX state, and emit a Markdown report. Supports both single-file and multi-node batch comparison. |
+
+## Installing a skill
+
+Cursor automatically loads `~/.cursor/skills/<skill-name>/SKILL.md`, so "installing" a skill is just copying the corresponding subdirectory into `~/.cursor/skills/` while keeping the directory name intact.
+
+### Steps
+
+#### 1. Clone this repo somewhere
+
+```bash
+git clone https://gitlab-master.nvidia.com/congliangx/skills.git
+cd skills
+```
+
+> If you already cloned it before, just `git pull` to fetch the latest version.
+
+#### 2. Install Python dependencies
+
+- Python **3.9+** (the bundled NVIDIA Xid decoder uses `zoneinfo` from the standard library)
+- Install the third-party Python packages required by bundled scripts:
+
+  ```bash
+  pip install -r requirements.txt
+  ```
+
+#### 3. Make sure the target directory exists
+
+```bash
+mkdir -p ~/.cursor/skills
+```
+
+#### 4. Sync the skill directory with `rsync -aPp`
+
+```bash
+rsync -aPp ./<skill-name> ~/.cursor/skills/
+```
+
+#### 5. Verify in Cursor / Claude Code
+
+Open Cursor, start a new chat, and prompt something matching the skill's description (e.g. "analyze this nv-bug-report.log"). The agent will load the skill and follow its `SKILL.md` workflow.
+
+---
+
+## Full example: installing `analyze-nv-bug-report`
+
+```bash
+# 1. Clone (first-time install)
+git clone https://gitlab-master.nvidia.com/congliangx/skills.git ~/repos/skills
+cd ~/repos/skills
+
+# 2. Install Python dependencies
+pip install -r requirements.txt
+
+# 3. Prepare skills root
+mkdir -p ~/.cursor/skills
+
+# 4. Sync the skill
+rsync -aPp ./analyze-nv-bug-report ~/.cursor/skills/
+
+# 5. Verify the install
+ls ~/.cursor/skills/analyze-nv-bug-report/
+# Expect:  SKILL.md  scripts/
+
+cat ~/.cursor/skills/analyze-nv-bug-report/SKILL.md | head -5
+# Expect frontmatter:
+# ---
+# name: analyze-nv-bug-report
+# description: Analyze NVIDIA nv-bug-report log files...
+```
+
+#### Using it inside Cursor
+
+Open a new chat, drop a log file into the input (or paste its path), and prompt:
+
+> Analyze this nv-bug-report
+
+The agent invokes the `analyze-nv-bug-report` skill and runs `scripts/analyze.py` to produce a Markdown report (plus a self-contained HTML sidecar).
+
+For a deeper walk-through of the internal modules, see [`doc/analyze-nv-bug-report-structure.md`](doc/analyze-nv-bug-report-structure.md).
+
+---
+
+
+## Platform support
+
+All bundled scripts run on both **Linux** and **macOS**. See each skill's `SKILL.md` for skill-specific notes.

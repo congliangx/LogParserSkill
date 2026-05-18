@@ -1,0 +1,15 @@
+# Python dependencies for scripts shipped under skills/<skill>/scripts/.
+#
+# Required by analyze-nv-bug-report/scripts/third_party/nvidia_xid_analyzer.py
+# (the NVIDIA-provided Xid decoder invoked as a subprocess by
+# analyze-nv-bug-report). Skills' own modular code (e.g. nvbug_report/*)
+# uses only the Python standard library and needs no extra packages.
+#
+# Python: 3.9+ (uses zoneinfo from stdlib).
+
+tabulate
+pandas
+openpyxl
+pytz
+tzlocal
+python-dateutil
