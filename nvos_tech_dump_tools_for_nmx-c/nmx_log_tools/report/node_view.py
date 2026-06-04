@@ -120,7 +120,7 @@ def _append_fm_event_table(
         if omitted > 0:
             r.paragraph(r.i_em(f"+{omitted} more record(s) omitted (capacity cap)."), note=True)
         table_rows = [[r.i_text(c) for c in _fm_event_row_cells(row)] for row in rows]
-        r.table(FM_EVENT_TABLE_COLUMNS, table_rows)
+        r.table(FM_EVENT_TABLE_COLUMNS, table_rows, css_class="tbl-fm-event")
     else:
         r.paragraph(r.i_em(f"{omitted} record(s) omitted (capacity cap)."), note=True)
     r.close_details()
@@ -352,7 +352,7 @@ def _render_event_group(r: Renderer, idx: int, cl: Dict[str, Any]) -> None:
             if cl.get("has_other_transitions"):
                 line.append(r.i_text(row.get("other_transitions") or "-"))
             table_rows.append(line)
-        r.table(table_hdr, table_rows)
+        r.table(table_hdr, table_rows, css_class="tbl-port-event")
     _append_fm_event_table(
         r,
         fm_rows,
@@ -536,5 +536,5 @@ def render_node(r: Renderer, node: NodeAnalysis, ctx: Dict[str, Any]) -> None:
                 type_cell,
                 r.i_text((ev.get("message") or "")[:120]),
             ])
-        r.table(["Time", "Type", "Message"], rows)
+        r.table(["Time", "Type", "Message"], rows, css_class="tbl-lifecycle")
         r.close_details()
