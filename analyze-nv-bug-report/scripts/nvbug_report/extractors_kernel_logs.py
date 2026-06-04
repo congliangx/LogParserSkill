@@ -1,11 +1,13 @@
 """Journal/syslog/dmesg scans for timestamps, Xid events, and non-Xid NVRM errors."""
 
 import re
+from collections import defaultdict
+from datetime import timedelta
 
 from nvbug_report.basics import normalize_bdf
-from nvbug_report.constants import XID_PATTERN_QUICK
+from nvbug_report.constants import DERIVATIVE_CAUSED_BY_RE, XID_PATTERN_QUICK
 from nvbug_report.sections import _get_dmesg_range, _get_syslog_ranges
-from nvbug_report.syslog_ts import _normalize_syslog_ts
+from nvbug_report.syslog_ts import _normalize_syslog_ts, _parse_syslog_ts
 
 _SYSLOG_TS_RE = re.compile(r"^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})")
 
@@ -71,12 +73,21 @@ def extract_xid_errors(lines, cache=None):
                 ts_match2 = re.match(r"^\[[\s]*([0-9.]+)\]", stripped)
                 if ts_match2:
                     timestamp = f"[{ts_match2.group(1)}]"
+        # Detect "caused by previous Xid <N>" annotation that marks NVRM
+        # derivative events (typically Xid 45 channel cleanup after a primary
+        # NVLink Xid 145/149). Downstream (report 7.1/7.3, comparison matrix)
+        # uses these flags to split counts and collapse repeated derivatives.
+        caused_by_m = DERIVATIVE_CAUSED_BY_RE.search(stripped)
+        is_derivative = caused_by_m is not None
+        caused_by = caused_by_m.group(1) if caused_by_m else None
         xids.append(
             {
                 "timestamp": timestamp,
                 "bdf": bdf,
                 "xid": xid_num,
                 "raw_line": stripped,
+                "is_derivative": is_derivative,
+                "caused_by": caused_by,
             }
         )
         raw_lines.append(stripped)
@@ -176,3 +187,107 @@ def extract_nvrm_errors(lines, exclude_payloads=None, cache=None):
                 continue
             _try_append(stripped)
     return errors
+
+
+# Default trigger / candidate / window used by infer_untagged_derivatives().
+# Trigger Xids: primary NVLink faults that produce channel cleanup cascades.
+# Candidate Xids: cleanup-style Xids that the NVRM driver sometimes emits
+#                 without the "caused by previous Xid N" annotation.
+# Window: how close in time a candidate Xid must be to its trigger.
+_DEFAULT_TRIGGER_XID_NUMS = (145, 149)
+_DEFAULT_CANDIDATE_XID_NUMS = (45,)
+_DEFAULT_INFER_WINDOW_SECONDS = 10
+
+
+def infer_untagged_derivatives(
+    xids,
+    *,
+    window_seconds=_DEFAULT_INFER_WINDOW_SECONDS,
+    trigger_xid_nums=_DEFAULT_TRIGGER_XID_NUMS,
+    candidate_xid_nums=_DEFAULT_CANDIDATE_XID_NUMS,
+    ref_year=None,
+):
+    """Retroactively flag untagged channel-cleanup Xids as derivative.
+
+    The NVRM kernel driver emits Xid 45 (ROBUST_CHANNEL_PREEMPTIVE_REMOVAL)
+    twice per NVLink-fault burst: a first batch with the annotation
+    ``caused by previous Xid N`` (caught by the regex during extraction), and
+    a second batch of "bare" Xid 45 lines for the remaining channels --
+    semantically identical cleanup but missing the textual attribution.
+
+    This pass walks ``xids`` after extraction and, for each candidate Xid
+    (default: 45) that is not yet marked derivative, checks whether a primary
+    trigger Xid (default: 145 or 149) occurred on the **same BDF** within
+    ``window_seconds`` (default: 10s). When a match is found:
+
+    * ``x["is_derivative"]`` is set to True (mutating the existing dict).
+    * ``x["caused_by"]`` is set to the trigger Xid number (string, e.g. "145").
+    * ``x["derivative_inferred"] = True`` is added so downstream code can
+      distinguish text-tagged derivatives ("caused by previous Xid N") from
+      time-inferred ones if needed.
+
+    Returns ``xids`` (same list reference, mutated in place) for chaining.
+
+    Args:
+        xids: list of xid dicts produced by ``extract_xid_errors``.
+        window_seconds: max time gap (seconds) between trigger and candidate.
+        trigger_xid_nums: iterable of Xid numbers that count as "primary trigger".
+        candidate_xid_nums: iterable of Xid numbers eligible for inference.
+        ref_year: reference year for syslog-format timestamps (which lack a year).
+                  Auto-detected from xid raw_lines when omitted.
+    """
+    if not xids:
+        return xids
+
+    if ref_year is None:
+        ref_year = 2026  # matches the convention used elsewhere
+        for x in xids:
+            raw = x.get("raw_line", "")
+            m = re.search(r"\b(20\d{2})\b", raw)
+            if m:
+                ref_year = int(m.group(1))
+                break
+
+    # Group primary triggers by BDF and sort by parsed timestamp so we can
+    # quickly find the most-recent trigger preceding a candidate.
+    per_bdf_triggers = defaultdict(list)  # bdf -> sorted list of (dt, xid_num)
+    for x in xids:
+        if x["xid"] not in trigger_xid_nums:
+            continue
+        dt = _parse_syslog_ts(x["timestamp"], ref_year)
+        if dt is None:
+            continue
+        per_bdf_triggers[x["bdf"]].append((dt, x["xid"]))
+    for bdf in per_bdf_triggers:
+        per_bdf_triggers[bdf].sort()
+
+    if not per_bdf_triggers:
+        return xids  # no primary triggers anywhere -> nothing to infer
+
+    window = timedelta(seconds=window_seconds)
+
+    for x in xids:
+        if x.get("is_derivative"):
+            continue
+        if x["xid"] not in candidate_xid_nums:
+            continue
+        dt = _parse_syslog_ts(x["timestamp"], ref_year)
+        if dt is None:
+            continue
+        triggers = per_bdf_triggers.get(x["bdf"])
+        if not triggers:
+            continue
+        # Scan for the latest trigger at or before `dt` within `window`.
+        # Triggers are timestamp-sorted; iterate while still in range.
+        best_xid_num = None
+        for t_dt, t_xid in triggers:
+            if t_dt > dt:
+                break
+            if dt - t_dt <= window:
+                best_xid_num = t_xid  # keep the most-recent qualifying trigger
+        if best_xid_num is not None:
+            x["is_derivative"] = True
+            x["caused_by"] = str(best_xid_num)
+            x["derivative_inferred"] = True
+
+    return xids

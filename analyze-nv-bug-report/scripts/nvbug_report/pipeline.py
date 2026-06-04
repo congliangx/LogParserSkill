@@ -12,6 +12,7 @@ from nvbug_report.extractors_kernel_logs import (
     extract_message_start_time,
     extract_nvrm_errors,
     extract_xid_errors,
+    infer_untagged_derivatives,
 )
 from nvbug_report.extractors_nvlink import extract_nvlink_errors, extract_nvlink_status
 from nvbug_report.extractors_pci_gpu import (
@@ -120,6 +121,15 @@ def analyze_single_file(filepath, artifact_root_dir=None):
     xids, raw_xid_lines, raw_xid_source_line_numbers = extract_xid_errors(lines, section_cache)
     _phase_end(filepath, "extract_xid_errors", t)
 
+    # NVRM driver sometimes omits the "caused by previous Xid N" annotation on
+    # later channels of the same cleanup burst (e.g. lines 970+ of a typical
+    # GB200 NVLink RLW event). Retroactively flag those "bare" Xid 45 entries
+    # as derivative when a primary Xid 145/149 happened on the same BDF within
+    # the last 10s, so 7.1 counts and 7.3 burst collapse stay consistent.
+    t = _phase_start()
+    infer_untagged_derivatives(xids)
+    _phase_end(filepath, "infer_untagged_derivatives", t)
+
     t = _phase_start()
     nvlink = extract_nvlink_errors(lines, section_cache)
     _phase_end(filepath, "extract_nvlink_errors", t)
@@ -184,9 +194,17 @@ def analyze_single_file(filepath, artifact_root_dir=None):
     xid_analyzer_error = ""
     xid_analyzer_stdout = ""
     xid_analyzer_stderr = ""
+    # Send all raw_xid_lines (primary + derivative) to the analyzer so 7.2's
+    # decode table reflects every Xid type that occurred in the log -- including
+    # Xid 45 (ROBUST_CHANNEL_PREEMPTIVE_REMOVAL) even on nodes where every
+    # Xid 45 instance is derivative. The analyzer's own dedup (run_xid_analyzer
+    # calls dict.fromkeys on input) collapses exact-duplicate lines, and 7.2's
+    # final dedup on (decoded_xid, mnemonic, resolution) keeps the table
+    # compact regardless of how many derivative lines were fed in.
     if raw_xid_lines:
         print(
-            f"Found {len(raw_xid_lines)} Xid errors, invoking nvidia_xid_analyzer for decoding...",
+            f"Found {len(raw_xid_lines)} Xid errors, "
+            f"invoking nvidia_xid_analyzer for decoding...",
             file=sys.stderr,
         )
         xid_decoded, _, xid_analyzer_error, xid_analyzer_stdout, xid_analyzer_stderr = run_xid_analyzer(

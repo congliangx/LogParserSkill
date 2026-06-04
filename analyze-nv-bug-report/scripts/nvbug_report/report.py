@@ -50,12 +50,130 @@ def group_xids_into_bursts(xids, gap_seconds=60):
     return bursts
 
 
-def _render_burst_log(burst, context_lines=None, max_per_xid=5, imex_lines=None):
+def _collapse_burst_derivatives(burst):
+    """Within a burst, keep every primary entry and collapse each
+    (xid, caused_by) derivative group to one representative.
+
+    Returns ``(display_list, notes)`` where:
+
+    * ``display_list`` preserves all primary entries plus one rep per
+      derivative (xid, caused_by) group, time-sorted for determinism.
+    * ``notes`` maps ``id(rep_dict) -> "+N more derivative Xid ... suppressed"``;
+      ``_render_burst_log`` consults this and appends the note immediately
+      after the rep's raw line.
+
+    The full burst is still passed unchanged to context-window / IMEX
+    correlation callers; only the rendered list is collapsed.
+    """
+    display = []
+    notes = {}
+    derivative_groups = {}  # (xid, caused_by) -> list of entries
+    for x in burst:
+        if x.get("is_derivative"):
+            key = (x["xid"], x.get("caused_by") or "?")
+            derivative_groups.setdefault(key, []).append(x)
+        else:
+            display.append(x)
+    for (xid_num, caused_by), group in derivative_groups.items():
+        rep = group[0]
+        display.append(rep)
+        if len(group) > 1:
+            notes[id(rep)] = (
+                f"+ {len(group) - 1} more derivative Xid {xid_num} entries "
+                f"(caused by Xid {caused_by}) suppressed"
+            )
+    display.sort(key=lambda x: x.get("timestamp", ""))
+    return display, notes
+
+
+_XID_SUBTYPE_RE = re.compile(
+    r"Xid \(PCI:[^)]+\):\s*\d+,\s*(?:pid=\d+,\s*name=\S+,\s*)?"
+    r"([A-Z][A-Z0-9_]+)\s+(Fatal|Nonfatal)",
+    re.IGNORECASE,
+)
+
+
+# NVLink-class Xid numbers per NVIDIA Server-RAS-Catalog "XID 144-150 Decode"
+# sheet -- the only Xid range whose NVRM driver lines carry the textual
+# `<Category> <Severity>` payload format (e.g. ``RLW_SRC_TRACK Nonfatal``).
+# Section 7.6 (per-node NVLink breakdown) and Section 3.1 (cross-node sub-type
+# breakdown) both filter on this tuple to ensure consistent scope.
+NVLINK_XID_NUMS = (144, 145, 146, 147, 148, 149, 150)
+
+
+def _xid_subtype_parts(raw_line):
+    """Return ``(category, severity)`` extracted from an NVRM Xid line.
+
+    Examples::
+
+        "... Xid (...): 145, RLW_SRC_TRACK Nonfatal XC1 ..."  -> ("RLW_SRC_TRACK", "Nonfatal")
+        "... Xid (...): 149, NETIR_LINK_DOWN Fatal XC0 ..."   -> ("NETIR_LINK_DOWN", "Fatal")
+        "... Xid (...): 45, pid=N, name=python, channel ..."  -> ("-", "-")
+        "... Xid (...): 137, RLW_RXPIPE interrupt hit ..."    -> ("-", "-")
+
+    The textual sub-type convention only applies to the NVLink-class Xid
+    range (144-150) per NVIDIA's Server-RAS-Catalog. For everything else
+    (cleanup Xid 45, GR fault Xid 44, NVLINK_PRIV_ERR Xid 137, recovery
+    notice Xid 154, ECC Xids, etc.) the NVRM driver emits a different
+    message format that doesn't carry a `<Category> <Severity>` token,
+    so the regex doesn't match and we return ``('-', '-')`` -- callers
+    treat that as "no further sub-type partitioning needed" and render
+    those rows in a single bucket.
+
+    Consumed by:
+      * section 7.1 (Xid Summary)        -- to split rows per sub-type
+      * section 7.6 (NVLink Breakdown)   -- per-link per-sub-type clusters
+      * cross-node 3.1                   -- per-host sub-type breakdown
+    """
+    if not raw_line:
+        return ("-", "-")
+    m = _XID_SUBTYPE_RE.search(raw_line)
+    if not m:
+        return ("-", "-")
+    return (m.group(1), m.group(2).capitalize())
+
+
+def _xid_subtype_tag(raw_line):
+    """Return a stable sub-type tag for collapse-keying purposes.
+
+    NVRM kernel driver tags NVLink-related Xid (typically 145/149) with a
+    textual category + severity, e.g.::
+
+        Xid (PCI:...): 145, RLW_SRC_TRACK Nonfatal XC1 i0 Link 03 (...)
+        Xid (PCI:...): 145, RLW_RXPIPE   Nonfatal XC0 i0 Link 03 (...)
+        Xid (PCI:...): 145, RLW_SRC_TRACK Fatal   XC0 i0 Link 03 (...)
+        Xid (PCI:...): 149, NETIR_LINK_DOWN Fatal XC0 i0 Link 03 (...)
+
+    These distinguish very different fault categories (e.g. Fatal vs Nonfatal,
+    RLW_SRC_TRACK vs RLW_RXPIPE). If raw-log collapse keyed on Xid number
+    alone, dozens of common-subtype lines would push rare-but-critical
+    sibling subtypes (a single Fatal entry hidden among hundreds of Nonfatal)
+    into the "...N more omitted..." bucket. Keying on (xid_num, subtype_tag)
+    keeps each subtype visible up to its own ``max_per_xid`` quota.
+
+    For Xid lines without a textual subtype (e.g. cleanup Xid 45 channel
+    lines), returns an empty string -- callers should treat that as "no
+    further partitioning needed".
+    """
+    category, severity = _xid_subtype_parts(raw_line)
+    if category == "-":
+        return ""
+    return f"{category}_{severity.lower()}"
+
+
+def _render_burst_log(burst, context_lines=None, max_per_xid=5, imex_lines=None,
+                      derivative_notes=None):
     """Render a burst's raw log lines with interleaved NVRM context, collapsing repeated Xid types.
 
     If imex_lines is provided (list of IMEX log entry dicts with "timestamp" and
     "raw_line"/"message" keys), the first few entries starting from the burst's
     earliest timestamp are prepended to the output.
+
+    If derivative_notes is provided (dict mapping ``id(xid_dict) -> note``,
+    produced by :func:`_collapse_burst_derivatives`), the note is emitted as
+    a ``# +N ... suppressed`` comment line immediately after the matching
+    representative line, so the rendered code block stays compact while
+    making the suppression explicit.
     """
     ref_year = 2026
 
@@ -85,18 +203,40 @@ def _render_burst_log(burst, context_lines=None, max_per_xid=5, imex_lines=None)
     merged.sort(key=lambda item: _parse_syslog_ts(item[1], ref_year) or _parse_imex_log_ts(item[1]) or datetime.min)
 
     lines_out = []
-    consecutive_xid = None
+    # Collapse key is (xid_num, subtype_tag) so e.g. Xid 145 RLW_SRC_TRACK
+    # Nonfatal does not eat the display quota of Xid 145 RLW_SRC_TRACK Fatal
+    # or Xid 145 RLW_RXPIPE Nonfatal -- rare-but-critical sibling sub-types
+    # remain visible up to their own ``max_per_xid`` budget.
+    consecutive_key = None       # tuple (xid_num, subtype_tag) or None
     consecutive_count = 0
     consecutive_shown = 0
 
+    def _format_kind_label(key):
+        xid_num, subtype = key
+        if subtype:
+            # subtype tag e.g. "RLW_SRC_TRACK_nonfatal" -> "Xid 145 RLW_SRC_TRACK Nonfatal"
+            base, _, sev = subtype.rpartition("_")
+            sev_disp = sev.capitalize() if sev else ""
+            return f"Xid {xid_num} {base} {sev_disp}".rstrip()
+        return f"Xid {xid_num}"
+
     def flush_consecutive():
-        nonlocal consecutive_count, consecutive_shown, consecutive_xid
-        if consecutive_count > consecutive_shown and consecutive_xid is not None:
+        nonlocal consecutive_count, consecutive_shown, consecutive_key
+        if consecutive_count > consecutive_shown and consecutive_key is not None:
+            label = _format_kind_label(consecutive_key)
             lines_out.append(
-                f"  ...({consecutive_count - consecutive_shown} more Xid {consecutive_xid} omitted)...")
-        consecutive_xid = None
+                f"  ...({consecutive_count - consecutive_shown} more {label} omitted)..."
+            )
+        consecutive_key = None
         consecutive_count = 0
         consecutive_shown = 0
+
+    _notes = derivative_notes or {}
+
+    def _maybe_emit_note(xid_item):
+        note = _notes.get(id(xid_item))
+        if note:
+            lines_out.append(f"  # {note}")
 
     for kind, ts, item in merged:
         if kind in ("ctx", "imex"):
@@ -104,17 +244,21 @@ def _render_burst_log(burst, context_lines=None, max_per_xid=5, imex_lines=None)
             lines_out.append(item["raw_line"])
         else:
             xid_num = item["xid"]
-            if xid_num == consecutive_xid:
+            subtype = _xid_subtype_tag(item.get("raw_line", ""))
+            key = (xid_num, subtype)
+            if key == consecutive_key:
                 consecutive_count += 1
                 if consecutive_shown < max_per_xid:
                     lines_out.append(item["raw_line"])
+                    _maybe_emit_note(item)
                     consecutive_shown += 1
             else:
                 flush_consecutive()
-                consecutive_xid = xid_num
+                consecutive_key = key
                 consecutive_count = 1
                 consecutive_shown = 1
                 lines_out.append(item["raw_line"])
+                _maybe_emit_note(item)
 
     flush_consecutive()
     return lines_out
@@ -696,19 +840,98 @@ def generate_report(filepath, sys_info, lspci_gpus, lspci_detail, smi_gpus, xids
     # --- 7.1 Xid Summary ---
     r.append(f"### {sec_msg}.1 Xid Summary\n")
     if xids:
-        xid_summary = defaultdict(int)
-        xid_by_gpu = defaultdict(lambda: defaultdict(int))
+        # Split primary vs derivative AND further partition by NVLink sub-type
+        # (Category + Severity) so rare Fatal / RLW_RXPIPE variants get their
+        # own row instead of disappearing under "Xid 145 = 1413" aggregate.
+        # Non-NVLink Xids (44/45/137/154/...) have no textual sub-type in the
+        # NVRM driver, so they bucket into a single ("-", "-") row per
+        # (BDF, Xid) -- visually identical to the pre-split layout.
+        #
+        # Key tuple: (bdf, xid_num, category, severity)
+        # Tracked via x["is_derivative"] / x["caused_by"] from extractors.
+        xid_primary = defaultdict(int)         # key -> primary count
+        xid_deriv = defaultdict(int)           # key -> derivative count
+        xid_deriv_source = defaultdict(set)    # key -> set of caused-by primaries
+        total_primary = 0
+        total_deriv = 0
         for x in xids:
-            xid_summary[x["xid"]] += 1
-            xid_by_gpu[x["bdf"]][x["xid"]] += 1
+            category, severity = _xid_subtype_parts(x.get("raw_line", ""))
+            key = (x["bdf"], x["xid"], category, severity)
+            if x.get("is_derivative"):
+                xid_deriv[key] += 1
+                if x.get("caused_by"):
+                    xid_deriv_source[key].add(x["caused_by"])
+                total_deriv += 1
+            else:
+                xid_primary[key] += 1
+                total_primary += 1
 
-        r.append(f"**Total {len(xids)} Xid errors**\n")
-        r.append("| GPU BDF | Xid | Count |")
-        r.append("|---------|-----|-------|")
-        for bdf in sorted(xid_by_gpu.keys()):
-            for xid_num in sorted(xid_by_gpu[bdf].keys()):
-                cnt = xid_by_gpu[bdf][xid_num]
-                r.append(f"| {bdf} | {xid_num} | {cnt} |")
+        r.append(
+            f"**Total {len(xids)} Xid errors** "
+            f"({total_primary} primary, {total_deriv} derivative)\n"
+        )
+        r.append(
+            "| GPU BDF | Xid | Category | Severity | Total | Primary | "
+            "Derivative | Caused-by |"
+        )
+        r.append(
+            "|---------|-----|----------|----------|-------|---------|"
+            "------------|-----------|"
+        )
+
+        def _row_sort_key(key):
+            bdf, xid_num, category, severity = key
+            # Fatal rows first within each (BDF, Xid), then Nonfatal, then "-"
+            sev_prio = {"Fatal": 0, "Nonfatal": 1}.get(severity, 2)
+            return (bdf, xid_num, sev_prio, category)
+
+        all_keys = sorted(set(xid_primary) | set(xid_deriv), key=_row_sort_key)
+        for key in all_keys:
+            bdf, xid_num, category, severity = key
+            p = xid_primary[key]
+            d = xid_deriv[key]
+            sources = xid_deriv_source[key]
+            if sources:
+                try:
+                    caused_by = ", ".join(sorted(sources, key=int))
+                except ValueError:
+                    caused_by = ", ".join(sorted(sources))
+            else:
+                caused_by = "-"
+            r.append(
+                f"| {bdf} | {xid_num} | {category} | {severity} | "
+                f"{p + d} | {p} | {d} | {caused_by} |"
+            )
+
+        if total_deriv:
+            inferred_n = sum(
+                1 for x in xids
+                if x.get("is_derivative") and x.get("derivative_inferred")
+            )
+            footer = (
+                "\n*Derivative Xids are NVRM lines tagged "
+                "\"caused by previous Xid N\" (typically Xid 45 channel "
+                "cleanup after a primary fault). Section 7.2 decodes every "
+                "Xid type (primary and derivative both feed the analyzer "
+                "so the decode table reflects all observed Xid mnemonics, "
+                "deduplicated by decode signature); section 7.3 collapses "
+                "repeated derivatives per burst."
+            )
+            if inferred_n:
+                footer += (
+                    f" Includes **{inferred_n} inferred** entries: bare Xid 45 "
+                    "lines without the textual tag that the NVRM driver "
+                    "emitted within 10s of a primary Xid 145/149 on the same "
+                    "BDF -- the same cleanup burst, attribution lost in the "
+                    "kernel log."
+                )
+            footer += (
+                " Category + Severity columns are populated for Xid 144-150 "
+                "(NVLink range, per NVIDIA Server-RAS-Catalog); other Xids "
+                "show \"-\" since the NVRM driver doesn't emit a textual "
+                "sub-type for them.*"
+            )
+            r.append(footer)
     else:
         r.append("No Xid errors found.")
 
@@ -768,15 +991,28 @@ def generate_report(filepath, sys_info, lspci_gpus, lspci_detail, smi_gpus, xids
         for idx_b, burst in enumerate(_bursts):
             ts_first = burst[0]["timestamp"]
             ts_last = burst[-1]["timestamp"]
+            # Burst-internal counts surface the suppression in the summary line.
+            _b_primary = sum(1 for x in burst if not x.get("is_derivative"))
+            _b_deriv = len(burst) - _b_primary
             if ts_first == ts_last:
-                summary = f"Event {idx_b + 1}: {ts_first} ({len(burst)} entries)"
+                summary = f"Event {idx_b + 1}: {ts_first} ({len(burst)} entries"
             else:
-                summary = f"Event {idx_b + 1}: {ts_first} ~ {ts_last} ({len(burst)} entries)"
+                summary = (
+                    f"Event {idx_b + 1}: {ts_first} ~ {ts_last} "
+                    f"({len(burst)} entries"
+                )
+            if _b_deriv:
+                summary += f"; {_b_primary} primary + {_b_deriv} derivative)"
+            else:
+                summary += ")"
             r.append(f"<details>")
             r.append(f"<summary>{summary}</summary>")
             r.append("")
             _related_imex_lines = None
             if imex_events:
+                # IMEX correlation uses the FULL burst (time range), not the
+                # collapsed display list, so derivative count doesn't affect
+                # the +/-60s correlation window.
                 _related = _find_related_imex_events(imex_events, burst, ref_year=_xid_ref_year, window_seconds=60)
                 if _related:
                     r.append(_format_imex_related_line(_related))
@@ -790,8 +1026,14 @@ def generate_report(filepath, sys_info, lspci_gpus, lspci_detail, smi_gpus, xids
                         imex_labels.append((ie_idx + 1, ie_ts))
                     xid_ts_label = ts_first if ts_first == ts_last else f"{ts_first} ~ {ts_last}"
                     _imex_xid_correlations.append((idx_b + 1, xid_ts_label, imex_labels))
+            display_burst, derivative_notes = _collapse_burst_derivatives(burst)
             r.append("```")
-            r.extend(_render_burst_log(burst, context_lines=_ctx.get(idx_b), imex_lines=_related_imex_lines))
+            r.extend(_render_burst_log(
+                display_burst,
+                context_lines=_ctx.get(idx_b),
+                imex_lines=_related_imex_lines,
+                derivative_notes=derivative_notes,
+            ))
             r.append("```")
             r.append("")
             r.append("</details>")
@@ -841,6 +1083,126 @@ def generate_report(filepath, sys_info, lspci_gpus, lspci_detail, smi_gpus, xids
                 r.append("")
                 r.append("</details>")
                 r.append("")
+
+    # --- 7.6 NVLink Xid 144-150 fault breakdown ---
+    # One combined collapsible block per dump that pivots all NVLink-class
+    # Xid 144-150 lines on (GPU BDF, Link, Xid number, sub-type Category,
+    # Severity), with the (HEX1, HEX2) payload fingerprint attached to each
+    # row. Covers the full NVLink5 Xid range per NVIDIA's Server-RAS-Catalog:
+    #   144 SAW_MVB         147 TREX
+    #   145 RLW_* (6 sub)   148 NVLPW_CTRL/NVLPW
+    #   146 TLW_* (5 sub)   149 NETIR_* (4 sub)
+    #                       150 MSE_*  (2 sub)
+    # Replaces the old 7.6 (PCI+Link cross-tab) and 7.7 (errorStatus combo)
+    # which forced the reader to mentally join two tables. Adding the
+    # sub-type axis surfaces rare Fatal / RLW_RXPIPE variants that the
+    # per-Xid-number aggregation would otherwise hide. NVLINK_XID_NUMS and
+    # _xid_subtype_parts are module-level so cross-node section 3.1 reuses
+    # the same scope and parsing.
+    nvlink_xids = [x for x in xids if x["xid"] in NVLINK_XID_NUMS]
+    if nvlink_xids:
+        link_re = re.compile(r"\bLink\s+(-?\d+)\b")
+        hex_re = re.compile(r"\b0x[0-9a-fA-F]{8}\b")
+
+        # cluster_key -> aggregate dict; cluster_key = (bdf, link, xid, category, severity)
+        clusters = defaultdict(
+            lambda: {"count": 0, "combos": [], "first": None}
+        )
+        for x in nvlink_xids:
+            raw = x.get("raw_line", "")
+            link_m = link_re.search(raw)
+            link = link_m.group(1) if link_m else "?"
+            category, severity = _xid_subtype_parts(raw)
+            hexes = hex_re.findall(raw)
+            combo = f"{hexes[0]} {hexes[1]}" if len(hexes) >= 2 else "-"
+            key = (x["bdf"], link, x["xid"], category, severity)
+            row = clusters[key]
+            row["count"] += 1
+            if combo not in row["combos"]:
+                row["combos"].append(combo)
+            if row["first"] is None:
+                row["first"] = x["timestamp"]
+
+        def _row_sort_key(key):
+            bdf, link, xid_num, category, severity = key
+            try:
+                link_n = int(link)
+            except (TypeError, ValueError):
+                link_n = 10 ** 9
+            # Severity priority: Fatal first (more urgent), then Nonfatal,
+            # then unknown ("-"). Lower number = sorted first.
+            sev_prio = {"Fatal": 0, "Nonfatal": 1}.get(severity, 2)
+            return (bdf, link_n, sev_prio, category, xid_num)
+
+        # Header summary metrics: per-Xid totals and Fatal counts for the
+        # full 144-150 range, dropping any Xid number absent from this dump
+        # so the summary stays compact.
+        bdf_set = {k[0] for k in clusters.keys()}
+        per_xid_total = {n: 0 for n in NVLINK_XID_NUMS}
+        per_xid_fatal = {n: 0 for n in NVLINK_XID_NUMS}
+        for k, v in clusters.items():
+            per_xid_total[k[2]] += v["count"]
+            if k[4] == "Fatal":
+                per_xid_fatal[k[2]] += v["count"]
+        per_xid_summary = ", ".join(
+            f"Xid {n} = {per_xid_total[n]}"
+            + (f" (Fatal {per_xid_fatal[n]})" if per_xid_fatal[n] else "")
+            for n in NVLINK_XID_NUMS if per_xid_total[n] > 0
+        )
+        summary_76 = (
+            f"NVLink Xid 144-150 Breakdown "
+            f"({len(bdf_set)} GPU(s), {len(clusters)} clusters; "
+            f"{per_xid_summary})"
+        )
+
+        r.append(f"\n### {sec_msg}.6 NVLink Xid 144-150 Fault Breakdown\n")
+        r.append("<details>")
+        r.append(f"<summary>{summary_76}</summary>")
+        r.append("")
+        r.append(
+            "| GPU BDF | Link | Xid | Category | Severity | Count | "
+            "errorStatus combo | First seen |"
+        )
+        r.append(
+            "|---------|------|-----|----------|----------|-------|"
+            "-------------------|------------|"
+        )
+        for key in sorted(clusters.keys(), key=_row_sort_key):
+            bdf, link, xid_num, category, severity = key
+            row = clusters[key]
+            if len(row["combos"]) == 1:
+                combo_disp = f"`{row['combos'][0]}`"
+            else:
+                # very rare; same cluster with multiple HEX1/HEX2 fingerprints
+                combo_disp = (
+                    f"`{row['combos'][0]}` *(+{len(row['combos']) - 1} other)*"
+                )
+            r.append(
+                f"| {bdf} | {link} | {xid_num} | {category} | {severity} | "
+                f"{row['count']} | {combo_disp} | {row['first'] or 'N/A'} |"
+            )
+        r.append("")
+        r.append(
+            "*Covers the NVLink Xid family per NVIDIA Server-RAS-Catalog: "
+            "**144** (SAW_MVB), **145** (RLW_* x6 subcodes), "
+            "**146** (TLW_* x5), **147** (TREX), **148** (NVLPW), "
+            "**149** (NETIR_* x4), **150** (MSE_* x2) -- "
+            "the only Xid range that uses the textual `<Category> <Severity>` "
+            "payload format in the NVRM driver. One row per (GPU BDF, Link, "
+            "Xid, Sub-type Category, Severity) cluster; Fatal rows sort first "
+            "within each Link. **Category** + **Severity** come from the "
+            "NVRM driver text (e.g. `RLW_SRC_TRACK Nonfatal`, "
+            "`NETIR_LINK_DOWN Fatal`). The **errorStatus combo** is the "
+            "(HEX1, HEX2) fingerprint of the first two hex words in the raw "
+            "Xid line -- an NVIDIA-internal payload pair whose bit layout is "
+            "not publicly documented, but empirically same-cluster lines "
+            "share the same combo. Same number-different-sub-type rows "
+            "(e.g. Xid 145 RLW_SRC_TRACK Fatal vs Nonfatal) are intentionally "
+            "kept separate so rare critical variants stay visible. Lifted "
+            "from AutoProcess.sh's per-link + first-2-word breakdown.*"
+        )
+        r.append("")
+        r.append("</details>")
 
     sec += 1
     r.append(f"\n## {sec}. Summary & Recommendations\n")

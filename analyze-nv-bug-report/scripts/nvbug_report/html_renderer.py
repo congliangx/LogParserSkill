@@ -11,7 +11,7 @@ document with:
 - Click-header table sorting (numeric / lexicographic auto-detect).
 - Top-bar search box that live-filters every table row by text.
 - "Expand all" / "Collapse all" controls for ``<details>`` blocks (IMEX events,
-  Xid raw logs, etc.).
+  Xid raw logs, NVBugs subsection, etc.).
 - ``prefers-color-scheme`` aware light / dark theme.
 - All CSS and JavaScript inlined; no external CDN, works offline.
 
