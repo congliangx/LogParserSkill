@@ -1,27 +1,38 @@
-# skills
+# LogParserSkill
 
-A collection of custom Agent Skills for Cursor / Claude Code. Each top-level subdirectory is a self-contained skill; the directory name is the skill name.
+A collection of custom Agent Skills and related NVIDIA log-analysis tools. Directories that contain a `SKILL.md` are installable Agent Skills; other directories may be standalone tooling or documentation.
 
 ## Repository layout
 
 ```
-skills/
+LogParserSkill/
 ├── README.md                         # This file
-├── requirements.txt                  # Python deps for bundled scripts
-├── analyze-nv-bug-report/            # Parse nvidia-bug-report.sh logs (ready)
+├── LICENSE
+├── requirements.txt                  # Python deps for analyze-nv-bug-report scripts
+├── analyze-nv-bug-report/            # Agent Skill for nvidia-bug-report.sh logs
 │   ├── SKILL.md
 │   └── scripts/
-├── analyze-nvosdump/                 # Placeholder, WIP
-├── analyze-partnerdiag/              # Placeholder, WIP
-└── doc/                              # Per-skill structure / design docs
-    └── analyze-nv-bug-report-structure.md
+│       ├── analyze.py
+│       ├── nvbug_report/
+│       └── third_party/              # Drop-in NVIDIA Xid analyzer assets; README only is committed
+├── doc/                              # Per-skill structure / design docs
+│   └── analyze-nv-bug-report-structure.md
+└── nvos_tech_dump_tools_for_nmx-c/   # Standalone NVOS NMX-C tech dump log-analysis toolkit
+    ├── README.md
+    ├── requirements.txt
+    ├── main.py
+    └── nmx_log_tools/
 ```
 
 ## Available skills
 
+Only directories with `SKILL.md` are listed here as Agent Skills.
+
 | Name | Purpose |
 |---|---|
 | [`analyze-nv-bug-report`](analyze-nv-bug-report/) | Analyze NVIDIA `nvidia-bug-report.sh` log files — extract GPU status, Xid errors, NVLink / IMEX state, and emit a Markdown report. Supports both single-file and multi-node batch comparison. |
+
+`nvos_tech_dump_tools_for_nmx-c/` is included in this repo as a standalone CLI toolkit for NVOS NMX-C tech dump logs. It is not auto-loaded as an Agent Skill because it does not contain a `SKILL.md`.
 
 ## Installing a skill
 
