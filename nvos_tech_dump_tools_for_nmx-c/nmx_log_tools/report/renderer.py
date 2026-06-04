@@ -22,8 +22,126 @@ that matches the existing behavior (GitHub-flavored Markdown renders them).
 
 from __future__ import annotations
 
+import re
 from html import escape as _html_escape
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
+
+# Inline JS for the HTML report: column sorting, row filtering, expand/collapse
+# all, and TOC scroll-spy. Kept verbatim from the cross-node report styling.
+_HTML_SCRIPT = """<script>
+(function () {
+  // ---------- 1. table sort ----------
+  function compareCells(a, b) {
+    var na = parseFloat(a.replace(/[, ]/g, ''));
+    var nb = parseFloat(b.replace(/[, ]/g, ''));
+    if (!isNaN(na) && !isNaN(nb) && /^-?\\d/.test(a.trim()) && /^-?\\d/.test(b.trim())) {
+      return na - nb;
+    }
+    return a.localeCompare(b, undefined, {numeric: true, sensitivity: 'base'});
+  }
+
+  function sortTable(table, colIdx, asc) {
+    var tbody = table.tBodies[0];
+    if (!tbody) return;
+    var rows = Array.prototype.slice.call(tbody.rows);
+    rows.sort(function (r1, r2) {
+      var c1 = (r1.cells[colIdx] && r1.cells[colIdx].innerText || '').trim();
+      var c2 = (r2.cells[colIdx] && r2.cells[colIdx].innerText || '').trim();
+      var cmp = compareCells(c1, c2);
+      return asc ? cmp : -cmp;
+    });
+    rows.forEach(function (r) { tbody.appendChild(r); });
+  }
+
+  document.querySelectorAll('table').forEach(function (table) {
+    var headers = table.querySelectorAll('thead th');
+    headers.forEach(function (th, idx) {
+      th.addEventListener('click', function () {
+        var asc = !th.classList.contains('sort-asc');
+        headers.forEach(function (h) { h.classList.remove('sort-asc', 'sort-desc'); });
+        th.classList.add(asc ? 'sort-asc' : 'sort-desc');
+        sortTable(table, idx, asc);
+      });
+      th.title = 'Click to sort';
+    });
+  });
+
+  // ---------- 2. search box ----------
+  var searchBox = document.getElementById('search-box');
+  if (searchBox) {
+    var debounceTimer = null;
+    searchBox.addEventListener('input', function () {
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(function () { applyFilter(searchBox.value); }, 120);
+    });
+  }
+
+  function applyFilter(q) {
+    q = (q || '').trim().toLowerCase();
+    document.querySelectorAll('table tbody tr').forEach(function (tr) {
+      if (!q) {
+        tr.classList.remove('search-hidden');
+      } else {
+        var hit = (tr.innerText || '').toLowerCase().indexOf(q) !== -1;
+        tr.classList.toggle('search-hidden', !hit);
+      }
+    });
+    // Auto-open <details> that contain matching content.
+    if (q) {
+      document.querySelectorAll('details').forEach(function (d) {
+        if ((d.innerText || '').toLowerCase().indexOf(q) !== -1) d.open = true;
+      });
+    }
+  }
+
+  // ---------- 3. expand/collapse all ----------
+  var expandBtn = document.getElementById('expand-all');
+  var collapseBtn = document.getElementById('collapse-all');
+  if (expandBtn) {
+    expandBtn.addEventListener('click', function () {
+      document.querySelectorAll('details').forEach(function (d) { d.open = true; });
+    });
+  }
+  if (collapseBtn) {
+    collapseBtn.addEventListener('click', function () {
+      document.querySelectorAll('details').forEach(function (d) { d.open = false; });
+    });
+  }
+
+  // ---------- 3b. sidebar toggle ----------
+  var sidebarToggle = document.getElementById('sidebar-toggle');
+  if (sidebarToggle) {
+    sidebarToggle.addEventListener('click', function () {
+      var collapsed = document.body.classList.toggle('sidebar-collapsed');
+      sidebarToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    });
+  }
+
+  // ---------- 4. TOC active link ----------
+  var tocLinks = document.querySelectorAll('.sidebar a[href^="#"]');
+  if (tocLinks.length) {
+    var headings = [];
+    tocLinks.forEach(function (a) {
+      var id = decodeURIComponent(a.getAttribute('href').slice(1));
+      var el = document.getElementById(id);
+      if (el) headings.push({id: id, el: el, link: a});
+    });
+    function onScroll() {
+      var top = window.scrollY + 80;
+      var current = null;
+      for (var i = 0; i < headings.length; i++) {
+        if (headings[i].el.offsetTop <= top) current = headings[i];
+        else break;
+      }
+      tocLinks.forEach(function (a) { a.classList.remove('active'); });
+      if (current) current.link.classList.add('active');
+    }
+    window.addEventListener('scroll', onScroll, {passive: true});
+    onScroll();
+  }
+})();
+</script>"""
 
 
 class Renderer:
@@ -47,9 +165,17 @@ class Renderer:
         """Emit a bulleted list. ``items`` may contain inline formatting."""
         raise NotImplementedError
 
-    def table(self, headers: List[str], rows: List[List[str]]) -> None:
+    def table(
+        self,
+        headers: List[str],
+        rows: List[List[str]],
+        *,
+        css_class: Optional[str] = None,
+    ) -> None:
         """Emit a table. Cell values may contain inline formatting (already
-        escaped). Headers are escaped by the renderer."""
+        escaped). Headers are escaped by the renderer. ``css_class`` is an
+        optional class applied to the ``<table>`` for per-table styling (e.g.
+        per-column ``max-width`` caps); backends without styling ignore it."""
         raise NotImplementedError
 
     def empty_note(self, text: str) -> None:
@@ -99,14 +225,42 @@ class Renderer:
 
 
 class HtmlRenderer(Renderer):
-    """Concrete renderer for the HTML report."""
+    """Concrete renderer for the HTML report.
 
-    def __init__(self, *, css: str) -> None:
+    Emits a GitHub-flavored document shell: a sticky top bar (title + row
+    filter + expand/collapse), a sidebar table of contents auto-built from the
+    headings, and a content column. Tables are sortable and filterable via the
+    inline ``<script>`` at the end. Headings get slugified ``id`` anchors so the
+    TOC can link to them.
+    """
+
+    # Heading levels surfaced in the sidebar TOC.
+    _TOC_MIN_LEVEL = 1
+    _TOC_MAX_LEVEL = 4
+
+    def __init__(self, *, css: str, title: str = "NMX-C Log Analysis") -> None:
         super().__init__()
         self._css = css
+        self._title = title
+        # (level, slug, text) recorded in document order for the sidebar TOC.
+        self._toc: List[Tuple[int, str, str]] = []
+        self._used_slugs: dict = {}
+
+    def _slugify(self, text: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "-", text.strip().lower()).strip("-")
+        if not slug:
+            slug = "section"
+        n = self._used_slugs.get(slug, 0)
+        self._used_slugs[slug] = n + 1
+        return slug if n == 0 else f"{slug}-{n}"
 
     def heading(self, level: int, text: str) -> None:
-        self.parts.append(f"<h{level}>{_html_escape(text)}</h{level}>")
+        slug = self._slugify(text)
+        if self._TOC_MIN_LEVEL <= level <= self._TOC_MAX_LEVEL:
+            self._toc.append((level, slug, text))
+        self.parts.append(
+            f"<h{level} id=\"{slug}\">{_html_escape(text)}</h{level}>"
+        )
 
     def paragraph(self, html_inner: str, *, note: bool = False) -> None:
         cls = " class='note'" if note else ""
@@ -120,11 +274,19 @@ class HtmlRenderer(Renderer):
             self.parts.append(f"<li>{it}</li>")
         self.parts.append("</ul>")
 
-    def table(self, headers: List[str], rows: List[List[str]]) -> None:
+    def table(
+        self,
+        headers: List[str],
+        rows: List[List[str]],
+        *,
+        css_class: Optional[str] = None,
+    ) -> None:
         if not rows:
             self.empty_note("No data.")
             return
-        self.parts.append("<table><thead><tr>")
+        cls = f" class=\"{_html_escape(css_class)}\"" if css_class else ""
+        self.parts.append(f"<div class=\"table-wrap\"><table{cls}>")
+        self.parts.append("<thead><tr>")
         for h in headers:
             self.parts.append(f"<th>{_html_escape(h)}</th>")
         self.parts.append("</tr></thead><tbody>")
@@ -132,9 +294,12 @@ class HtmlRenderer(Renderer):
             self.parts.append("<tr>")
             for cell in row:
                 # Cell values already contain renderer-formatted inline HTML.
-                self.parts.append(f"<td>{cell}</td>")
+                # The inner .cell <div> is a block box so its max-width is
+                # honored (a <td>'s max-width is ignored in auto table layout),
+                # letting per-column width caps actually wrap long values.
+                self.parts.append(f"<td><div class=\"cell\">{cell}</div></td>")
             self.parts.append("</tr>")
-        self.parts.append("</tbody></table>")
+        self.parts.append("</tbody></table></div>")
 
     def empty_note(self, text: str) -> None:
         self.parts.append(f"<p><em>{_html_escape(text)}</em></p>")
@@ -178,13 +343,71 @@ class HtmlRenderer(Renderer):
         inner = self.i_bold(s) if bold else _html_escape(s)
         return f"<span style=\"color:red\">{inner}</span>"
 
+    def _render_toc(self) -> str:
+        """Build a nested <ul> TOC from the recorded (level, slug, text)."""
+        if not self._toc:
+            return ""
+        # Normalize so the first entry sits at depth 1 regardless of its
+        # heading level, then nest by relative level changes.
+        base = min(level for level, _, _ in self._toc)
+        out: List[str] = ["<div class=\"toc\">"]
+        prev = 0  # current open depth (number of nested <ul>/<li> pairs)
+        for level, slug, text in self._toc:
+            depth = level - base + 1
+            if depth > prev:
+                # Descend: open a fresh <ul> for each level jumped.
+                out.append("<ul>" * (depth - prev))
+            elif depth < prev:
+                # Ascend: close the current item, then each list+item pair
+                # back up to the target depth.
+                out.append("</li>")
+                out.append("</ul></li>" * (prev - depth))
+            else:
+                out.append("</li>")
+            out.append(f"<li><a href=\"#{slug}\">{_html_escape(text)}</a>")
+            prev = depth
+        # Close the final item and unwind every still-open list.
+        out.append("</li>")
+        out.append("</ul></li>" * (prev - 1))
+        out.append("</ul>")
+        out.append("</div>")
+        return "\n".join(out)
+
     def render(self) -> str:
         head = [
-            "<!DOCTYPE html><html><head><meta charset='utf-8'>",
-            "<title>NMX-C Log Analysis</title>",
-            f"<style>{self._css}</style></head><body>",
+            "<!DOCTYPE html>",
+            "<html lang=\"en\">",
+            "<head>",
+            "<meta charset=\"UTF-8\">",
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">",
+            f"<title>{_html_escape(self._title)}</title>",
+            f"<style>{self._css}</style>",
+            "</head>",
+            "<body data-kind=\"nmx_c\">",
+            "<header class=\"topbar\">",
+            "  <button type=\"button\" id=\"sidebar-toggle\" class=\"sidebar-toggle\""
+            " title=\"Toggle table of contents\" aria-label=\"Toggle sidebar\""
+            " aria-expanded=\"true\">☰</button>",
+            f"  <h1 class=\"topbar-title\">{_html_escape(self._title)}</h1>",
+            "  <div class=\"topbar-actions\">",
+            "    <input type=\"search\" id=\"search-box\" placeholder=\"Filter rows...\" aria-label=\"Filter rows\">",
+            "    <button type=\"button\" id=\"expand-all\" title=\"Expand all collapsible sections\">Expand all</button>",
+            "    <button type=\"button\" id=\"collapse-all\" title=\"Collapse all collapsible sections\">Collapse all</button>",
+            "  </div>",
+            "</header>",
+            "<div class=\"layout\">",
+            "  <nav class=\"sidebar\" aria-label=\"Table of contents\">",
+            self._render_toc(),
+            "  </nav>",
+            "  <main class=\"content\">",
         ]
-        tail = ["<hr><p><small>log_tools_for_nmx-c</small></p></body></html>"]
+        tail = [
+            "<hr><p><small>log_tools_for_nmx-c</small></p>",
+            "  </main>",
+            "</div>",
+            _HTML_SCRIPT,
+            "</body></html>",
+        ]
         return "\n".join(head + self.parts + tail)
 
 
@@ -217,7 +440,15 @@ class MdRenderer(Renderer):
         if items:
             self.parts.append("")
 
-    def table(self, headers: List[str], rows: List[List[str]]) -> None:
+    def table(
+        self,
+        headers: List[str],
+        rows: List[List[str]],
+        *,
+        css_class: Optional[str] = None,
+    ) -> None:
+        # Markdown has no per-table styling; css_class is accepted for API
+        # parity with HtmlRenderer and ignored.
         if not rows:
             self.empty_note("No data.")
             return
