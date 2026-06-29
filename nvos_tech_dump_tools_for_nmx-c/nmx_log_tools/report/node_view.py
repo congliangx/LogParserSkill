@@ -56,6 +56,11 @@ def rows_have_nvl_fatal(rows: List[FmEventRow]) -> bool:
     return any((r.category or "") == "nvl_fatal" for r in rows)
 
 
+def rows_have_nvl_non_fatal(rows: List[FmEventRow]) -> bool:
+    """True if any FM event row carries the ``nvl_non_fatal`` category."""
+    return any((r.category or "") == "nvl_non_fatal" for r in rows)
+
+
 def _fm_event_row_cells(row: FmEventRow) -> List[str]:
     return [
         row.ts or "-",
@@ -379,17 +384,31 @@ def _render_event_group_section(r: Renderer, ctx: Dict[str, Any]) -> None:
         note=True,
     )
 
-    red_pairs: List[tuple] = []
+    fatal_pairs: List[tuple] = []
+    non_fatal_pairs: List[tuple] = []
     normal_pairs: List[tuple] = []
     for i, cl in enumerate(event_groups, 1):
         fm_rows = cl.get("fm_event_rows") or []
-        (red_pairs if rows_have_nvl_fatal(fm_rows) else normal_pairs).append((i, cl))
+        if rows_have_nvl_fatal(fm_rows):
+            fatal_pairs.append((i, cl))
+        elif rows_have_nvl_non_fatal(fm_rows):
+            non_fatal_pairs.append((i, cl))
+        else:
+            normal_pairs.append((i, cl))
 
-    if red_pairs:
+    if fatal_pairs:
         r.open_details(
             r.i_red("Event groups with Xid (nvl_fatal) events", bold=True)
         )
-        for idx, cl in red_pairs:
+        for idx, cl in fatal_pairs:
+            _render_event_group(r, idx, cl)
+        r.close_details()
+
+    if non_fatal_pairs:
+        r.open_details(
+            r.i_bold("Event groups with Xid (nvl_non_fatal) events")
+        )
+        for idx, cl in non_fatal_pairs:
             _render_event_group(r, idx, cl)
         r.close_details()
 
