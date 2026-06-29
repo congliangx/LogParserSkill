@@ -238,5 +238,5 @@ def _format_imex_related_line(matching_events, show_reporting_host=False):
     """
     if not matching_events:
         return ""
-    event_labels = [f"Event {idx + 1}" for idx, _event in matching_events]
-    return "> **Related IMEX Events**: " + ", ".join(event_labels)
+    event_labels = [f"Event Group {idx + 1}" for idx, _event in matching_events]
+    return "> **Related IMEX Event Groups**: " + ", ".join(event_labels)

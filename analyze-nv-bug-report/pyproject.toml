@@ -1,0 +1,14 @@
+[project]
+name = "analyze-nv-bug-report"
+version = "0.1.0"
+description = "Parse NVIDIA nvidia-bug-report.sh logs into a Markdown + HTML diagnostic report."
+requires-python = ">=3.12"
+dependencies = [
+    "tabulate",
+    "pandas",
+    "openpyxl",
+    "pytz",
+    "tzlocal",
+    "python-dateutil",
+    "markdown",
+]

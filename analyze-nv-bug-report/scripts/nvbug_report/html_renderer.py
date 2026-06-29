@@ -21,6 +21,16 @@ The module only raises:
 
 Callers should wrap the call in ``try/except`` so HTML generation never blocks
 the existing markdown output.
+
+CLI: run this module directly to (re-)render the ``.html`` sidecar for one or
+more report ``.md`` files on disk. Use it after hand-editing a ``.md`` (e.g.
+appending the cross-node ``6.1 Analysis Summary`` or a ``NVBugs Related Bugs``
+section) so the HTML is regenerated with this exact renderer -- never hand-roll
+HTML by any other means::
+
+    python scripts/nvbug_report/html_renderer.py <report.md> [more.md ...]
+
+``--kind`` / ``--title`` are auto-detected per file when omitted.
 """
 
 from __future__ import annotations
@@ -869,3 +879,69 @@ def write_sidecar_html(
         return None
     print(f"HTML report saved to: {html_path}", file=sys.stderr)
     return html_path
+
+
+# ---------------------------------------------------------------------------
+# CLI entry: re-render report .md file(s) into their .html sidecar(s)
+# ---------------------------------------------------------------------------
+
+def _cli_infer_kind(md_path: str) -> str:
+    """``cross-node-report.md`` -> ``'cross_node'``; everything else -> ``'per_node'``."""
+    return "cross_node" if "cross-node" in os.path.basename(md_path).lower() else "per_node"
+
+
+def _cli_infer_title(md_path: str) -> str:
+    """Derive a clean document title from the report filename."""
+    base = os.path.basename(md_path)
+    if base.lower().endswith(".md"):
+        base = base[:-3]
+    if base.endswith("-analysis-report"):
+        base = base[: -len("-analysis-report")]
+    return base or os.path.basename(md_path)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """(Re-)render the ``.html`` sidecar for one or more report ``.md`` files.
+
+    Run this after editing a ``.md`` by hand (appending the cross-node
+    ``6.1 Analysis Summary`` or a ``NVBugs Related Bugs`` section) so the HTML
+    is regenerated with the SAME renderer ``analyze.py`` uses. Never hand-roll
+    HTML by any other means.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="html_renderer.py",
+        description="(Re-)render the .html sidecar for an analysis report .md "
+                    "(reuses analyze.py's renderer; run after editing the .md).",
+    )
+    parser.add_argument("md_files", nargs="+", help="One or more <report>.md files")
+    parser.add_argument(
+        "--kind", choices=["per_node", "cross_node"], default=None,
+        help="Override the report kind (default: auto-detect from filename).",
+    )
+    parser.add_argument(
+        "--title", default=None,
+        help="Override the document title (default: derived from filename).",
+    )
+    args = parser.parse_args(argv)
+
+    rc = 0
+    for md_path in args.md_files:
+        if not os.path.isfile(md_path):
+            print(f"Error: file not found: {md_path}", file=sys.stderr)
+            rc = 1
+            continue
+        with open(md_path, "r", encoding="utf-8") as f:
+            md_text = f.read()
+        kind = args.kind or _cli_infer_kind(md_path)
+        title = args.title or _cli_infer_title(md_path)
+        # write_sidecar_html prints "HTML report saved to: ..." on success and a
+        # "[warn] ..." line (returning None) on any failure -- it never raises.
+        if write_sidecar_html(md_path, md_text, title=title, kind=kind) is None:
+            rc = 1
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

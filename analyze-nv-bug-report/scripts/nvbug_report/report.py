@@ -778,7 +778,7 @@ def generate_report(filepath, sys_info, lspci_gpus, lspci_detail, smi_gpus, xids
                 n_total = len(event)
                 n_unique = len(summary_lines)
                 count_label = f"{n_total} messages, {n_unique} unique" if n_unique != n_total else f"{n_total} messages"
-                r.append(f"<details><summary>Event {ev_idx + 1}: {ts_label} ({count_label})</summary>")
+                r.append(f"<details><summary>Event Group {ev_idx + 1}: {ts_label} ({count_label})</summary>")
                 r.append("")
                 for sl in summary_lines:
                     r.append(f"- {sl}")
@@ -995,10 +995,10 @@ def generate_report(filepath, sys_info, lspci_gpus, lspci_detail, smi_gpus, xids
             _b_primary = sum(1 for x in burst if not x.get("is_derivative"))
             _b_deriv = len(burst) - _b_primary
             if ts_first == ts_last:
-                summary = f"Event {idx_b + 1}: {ts_first} ({len(burst)} entries"
+                summary = f"Event Group {idx_b + 1}: {ts_first} ({len(burst)} entries"
             else:
                 summary = (
-                    f"Event {idx_b + 1}: {ts_first} ~ {ts_last} "
+                    f"Event Group {idx_b + 1}: {ts_first} ~ {ts_last} "
                     f"({len(burst)} entries"
                 )
             if _b_deriv:
@@ -1292,7 +1292,7 @@ def generate_report(filepath, sys_info, lspci_gpus, lspci_detail, smi_gpus, xids
             for xid_ev, xid_ts, imex_list in _imex_xid_correlations:
                 for ie_num, ie_ts in imex_list:
                     issues_warn.append(
-                        f"IMEX Event {ie_num} ({ie_ts}) <-> Xid Event {xid_ev} ({xid_ts})")
+                        f"IMEX Event Group {ie_num} ({ie_ts}) <-> Xid Event Group {xid_ev} ({xid_ts})")
     if smi_pcie_issues:
         issues_warn.append("nvidia-smi reports PCIe link width not at maximum")
     if dmesg_highlights is None:

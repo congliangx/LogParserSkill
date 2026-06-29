@@ -1,6 +1,6 @@
 # LogParserSkill
 
-A collection of custom Agent Skills and related NVIDIA log-analysis tools. Directories that contain a `SKILL.md` are installable Agent Skills; other directories may be standalone tooling or documentation.
+A collection of custom Agent Skills and related NVIDIA log-analysis tools. Directories that contain a `SKILL.md` are installable Agent Skills; other directories may be standalone tooling or documentation. The skill `SKILL.md` files use only relative paths for bundled scripts, so the same directory installs unchanged into **Cursor**, **Claude Code**, or **Codex**.
 
 ## Repository layout
 
@@ -8,13 +8,15 @@ A collection of custom Agent Skills and related NVIDIA log-analysis tools. Direc
 LogParserSkill/
 ├── README.md                         # This file
 ├── LICENSE
-├── requirements.txt                  # Python deps for analyze-nv-bug-report scripts
+├── requirements.txt                  # pip fallback deps (the per-skill uv project is the primary path)
 ├── analyze-nv-bug-report/            # Agent Skill for nvidia-bug-report.sh logs
 │   ├── SKILL.md
+│   ├── pyproject.toml                # per-skill uv project (deps); `uv sync` builds .venv/
+│   ├── uv.lock                       # pinned dependency versions (committed)
 │   └── scripts/
 │       ├── analyze.py
 │       ├── nvbug_report/
-│       └── third_party/              # Drop-in NVIDIA Xid analyzer assets; README only is committed
+│       └── third_party/              # NVIDIA Xid analyzer assets — drop-in required; only README is committed
 ├── doc/                              # Per-skill structure / design docs
 │   └── analyze-nv-bug-report-structure.md
 └── nvos_tech_dump_tools_for_nmx-c/   # Standalone NVOS NMX-C tech dump log-analysis toolkit
@@ -30,33 +32,41 @@ Only directories with `SKILL.md` are listed here as Agent Skills.
 
 | Name | Purpose |
 |---|---|
-| [`analyze-nv-bug-report`](analyze-nv-bug-report/) | Analyze NVIDIA `nvidia-bug-report.sh` log files — extract GPU status, Xid errors, NVLink / IMEX state, and emit a Markdown report. Supports both single-file and multi-node batch comparison. |
+| [`analyze-nv-bug-report`](analyze-nv-bug-report/) | Analyze NVIDIA `nvidia-bug-report.sh` log files — extract GPU status, Xid errors, NVLink / IMEX state, and emit a Markdown report (plus a self-contained HTML sidecar). Supports both single-file and multi-node batch comparison. |
 
 `nvos_tech_dump_tools_for_nmx-c/` is included in this repo as a standalone CLI toolkit for NVOS NMX-C tech dump logs. It is not auto-loaded as an Agent Skill because it does not contain a `SKILL.md`.
 
 ## Installing a skill
 
-Cursor automatically loads `~/.cursor/skills/<skill-name>/SKILL.md`, so "installing" a skill is just copying the corresponding subdirectory into `~/.cursor/skills/` while keeping the directory name intact.
+Each skill installs as a directory named after the skill, containing `SKILL.md` + `scripts/`. Because the `SKILL.md` files reference bundled scripts only by relative path, the same directory installs unchanged into Cursor, Claude Code, or Codex — just pick the install root that matches your tool:
+
+| Tool | Install root | How the agent picks the skill up |
+|---|---|---|
+| Cursor | `~/.cursor/skills/<skill>/` | Auto-loaded — restart chat to see new skills. |
+| Claude Code | `~/.claude/skills/<skill>/` (global) or `<project>/.claude/skills/<skill>/` (project) | Auto-loaded — global skills available everywhere, project skills only inside that repo. |
+| Codex | `~/.codex/skills/<skill>/` | Auto-loaded — restart Codex session if needed. |
+
+> **Prerequisite:** [`uv`](https://docs.astral.sh/uv/) on your `PATH`. `analyze-nv-bug-report` manages its own Python dependencies through a per-skill `uv` project — `uv` installs a pinned interpreter (Python 3.12) and builds a per-skill `.venv/`, so there is no system-Python requirement and nothing to `pip install` globally. (No `uv`? See the pip fallback in step 5.)
 
 ### Steps
 
 #### 1. Clone this repo somewhere
 
 ```bash
-git clone https://gitlab-master.nvidia.com/congliangx/skills.git
-cd skills
+git clone https://github.com/congliangx/LogParserSkill.git
+cd LogParserSkill
 ```
 
 > If you already cloned it before, just `git pull` to fetch the latest version.
 
-#### 2. Install Python dependencies
+#### 2. Prepare the skills root for your tool
 
-- Python **3.9+** (the bundled NVIDIA Xid decoder uses `zoneinfo` from the standard library)
-- Install the third-party Python packages required by bundled scripts:
-
-  ```bash
-  pip install -r requirements.txt
-  ```
+```bash
+mkdir -p ~/.cursor/skills    # Cursor
+mkdir -p ~/.claude/skills    # Claude Code (user-level)
+mkdir -p ~/.codex/skills     # Codex
+# Project-level Claude Code skills go to <project>/.claude/skills/ — no mkdir if you don't use them
+```
 
 #### 3. Drop in third-party assets (analyze-nv-bug-report only)
 
@@ -67,68 +77,97 @@ cd skills
 | `nvidia_xid_analyzer.py` | NVIDIA Xid analyzer bundle |
 | `Server-RAS-Catalog.xlsx` | NVIDIA Xid analyzer bundle |
 
-Details (provenance, redistribution policy, sanity-check snippet) live in [`analyze-nv-bug-report/scripts/third_party/README.md`](analyze-nv-bug-report/scripts/third_party/README.md). If you skip this step, the skill still runs, but section §7.2 (Xid Detailed Decode) of the report will be skipped with a "Required assets missing" warning.
+Provenance, redistribution policy, and a sanity-check snippet live in [`analyze-nv-bug-report/scripts/third_party/README.md`](analyze-nv-bug-report/scripts/third_party/README.md). If you skip this step the skill still runs, but section §7.2 (Xid Detailed Decode) of the report is skipped with a "Required assets missing" warning.
 
-#### 4. Make sure the target directory exists
-
-```bash
-mkdir -p ~/.cursor/skills
-```
-
-#### 5. Sync the skill directory with `rsync -aPp`
+#### 4. Sync the skill directory with `rsync -aPp`
 
 ```bash
+# Cursor
 rsync -aPp ./<skill-name> ~/.cursor/skills/
+
+# Claude Code (user-level)
+rsync -aPp ./<skill-name> ~/.claude/skills/
+
+# Codex
+rsync -aPp ./<skill-name> ~/.codex/skills/
 ```
 
-#### 6. Verify in Cursor / Claude Code
+#### 5. Build the skill's `uv` environment at the install location
 
-Open Cursor, start a new chat, and prompt something matching the skill's description (e.g. "analyze this nv-bug-report.log"). The agent will load the skill and follow its `SKILL.md` workflow.
+A `.venv` is not path-portable, so build it **in place** after syncing (do NOT `uv sync` in the clone and rsync it across — create it at the install root):
+
+```bash
+uv sync --project ~/.claude/skills/analyze-nv-bug-report   # swap the root for Cursor / Codex
+```
+
+Afterwards the skill runs every script directly through that env — e.g. `~/.claude/skills/analyze-nv-bug-report/.venv/bin/python scripts/analyze.py ...` (its `SKILL.md` does this automatically). It calls `.venv/bin/python` directly, not `uv run`, so no write access to the skill dir is needed at run time.
+
+> **No `uv`?** Fallback: install the deps into any Python 3.9+ interpreter, then have the skill call that interpreter —
+> ```bash
+> pip install -r requirements.txt
+> ```
+
+#### 6. (Optional) Register the NVBugs MCP server for `analyze-nv-bug-report`
+
+Step 2.5 of `analyze-nv-bug-report/SKILL.md` can call the `nvbugs_search` tool on a MaaS-hosted MCP server (`user-MaaS NVBugs`) to attach related bugs to the report. This lookup is **disabled by default** — the skill runs it only when you explicitly ask (e.g. "search nvbugs" in chat), and even then it is optional: if the server is not registered the skill prints a one-line notice and appends no bugs section. To make the lookup available, register the server in your tool's MCP config:
+
+- **Claude Code**: add an entry under `mcpServers` in `~/.claude.json` (or `~/.config/claude-code/mcp.json`, depending on version).
+- **Cursor**: add the server under `mcpServers` in `~/.cursor/mcp.json`.
+- **Codex**: add the server under `mcp_servers` in `~/.codex/config.toml`.
+
+Use the exact server name `user-MaaS NVBugs` so the `SKILL.md` procedure matches.
+
+#### 7. Verify in the target tool
+
+Open a new chat in the tool and prompt something matching the skill's description (e.g. "analyze this nv-bug-report.log"). The agent will load the skill and follow its `SKILL.md` workflow.
 
 ---
 
-## Full example: installing `analyze-nv-bug-report`
+## Full example: installing `analyze-nv-bug-report` for Claude Code
 
 ```bash
 # 1. Clone (first-time install)
-git clone https://gitlab-master.nvidia.com/congliangx/skills.git ~/repos/skills
-cd ~/repos/skills
+git clone https://github.com/congliangx/LogParserSkill.git ~/repos/LogParserSkill
+cd ~/repos/LogParserSkill
 
-# 2. Install Python dependencies
-pip install -r requirements.txt
+# 2. Prepare skills root (user-level Claude Code)
+mkdir -p ~/.claude/skills
 
 # 3. Drop in NVIDIA Xid analyzer assets (see analyze-nv-bug-report/scripts/third_party/README.md)
 #    Required: nvidia_xid_analyzer.py  Server-RAS-Catalog.xlsx
 cp /path/to/extracted/nvidia_xid_analyzer.py    analyze-nv-bug-report/scripts/third_party/
 cp /path/to/extracted/Server-RAS-Catalog.xlsx   analyze-nv-bug-report/scripts/third_party/
 
-# 4. Prepare skills root
-mkdir -p ~/.cursor/skills
+# 4. Sync the skill to its install root
+rsync -aPp ./analyze-nv-bug-report ~/.claude/skills/
 
-# 5. Sync the skill
-rsync -aPp ./analyze-nv-bug-report ~/.cursor/skills/
+# 5. Build the skill's uv environment AT the install location
+#    (creates ~/.claude/skills/analyze-nv-bug-report/.venv ; needs `uv` on PATH)
+uv sync --project ~/.claude/skills/analyze-nv-bug-report
 
 # 6. Verify the install
-ls ~/.cursor/skills/analyze-nv-bug-report/
-# Expect:  SKILL.md  scripts/
+ls ~/.claude/skills/analyze-nv-bug-report/
+# Expect:  SKILL.md  pyproject.toml  uv.lock  scripts/  .venv/
 
-ls ~/.cursor/skills/analyze-nv-bug-report/scripts/third_party/
+ls ~/.claude/skills/analyze-nv-bug-report/scripts/third_party/
 # Expect:  README.md  nvidia_xid_analyzer.py  Server-RAS-Catalog.xlsx
 
-cat ~/.cursor/skills/analyze-nv-bug-report/SKILL.md | head -5
+head -5 ~/.claude/skills/analyze-nv-bug-report/SKILL.md
 # Expect frontmatter:
 # ---
 # name: analyze-nv-bug-report
 # description: Analyze NVIDIA nv-bug-report log files...
 ```
 
-#### Using it inside Cursor
+For Cursor, swap `~/.claude/skills/` → `~/.cursor/skills/`. For Codex, swap → `~/.codex/skills/`. Everything else is identical.
+
+#### Using it inside the tool
 
 Open a new chat, drop a log file into the input (or paste its path), and prompt:
 
 > Analyze this nv-bug-report
 
-The agent invokes the `analyze-nv-bug-report` skill and runs `scripts/analyze.py` to produce a Markdown report (plus a self-contained HTML sidecar).
+The agent invokes the `analyze-nv-bug-report` skill, runs `scripts/analyze.py` through the skill's own `.venv/bin/python` to produce a Markdown report (plus a self-contained HTML sidecar), and — only when you explicitly ask for NVBugs lookup, Xid errors are present, and the NVBugs MCP server from step 6 is registered — attaches related bugs to the report. NVBugs lookup is **disabled by default**; see [`analyze-nv-bug-report/SKILL.md`](analyze-nv-bug-report/SKILL.md) Step 2.5, and say "search nvbugs" in chat to opt in.
 
 For a deeper walk-through of the internal modules, see [`doc/analyze-nv-bug-report-structure.md`](doc/analyze-nv-bug-report-structure.md).
 
