@@ -1,1 +1,6 @@
 *.pyc
+__pycache__/
+
+# Per-skill uv virtual environments — built in place via `uv sync` at the
+# install location; a .venv is not path-portable, so it is never committed.
+.venv/

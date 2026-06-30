@@ -1,0 +1,9 @@
+[project]
+name = "nvos-tech-dump-tools-for-nmx-c"
+version = "0.1.0"
+description = "Analyze NVLSM + Fabric Manager logs under log/nmx/nmx-c in NVOS / NMX-C tech dumps into a Markdown + HTML report."
+requires-python = ">=3.9"
+# Standard library only — no third-party runtime dependencies. The uv project
+# exists to pin a Python interpreter and build a per-skill .venv/, matching the
+# analyze-nv-bug-report skill's layout (so the same install flow works for both).
+dependencies = []

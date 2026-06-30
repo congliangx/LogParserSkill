@@ -8,7 +8,7 @@ A collection of custom Agent Skills and related NVIDIA log-analysis tools. Direc
 LogParserSkill/
 ├── README.md                         # This file
 ├── LICENSE
-├── requirements.txt                  # pip fallback deps (the per-skill uv project is the primary path)
+├── requirements.txt                  # pip fallback deps for analyze-nv-bug-report (its uv project is the primary path)
 ├── analyze-nv-bug-report/            # Agent Skill for nvidia-bug-report.sh logs
 │   ├── SKILL.md
 │   ├── pyproject.toml                # per-skill uv project (deps); `uv sync` builds .venv/
@@ -17,13 +17,15 @@ LogParserSkill/
 │       ├── analyze.py
 │       ├── nvbug_report/
 │       └── third_party/              # NVIDIA Xid analyzer assets — drop-in required; only README is committed
-├── doc/                              # Per-skill structure / design docs
-│   └── analyze-nv-bug-report-structure.md
-└── nvos_tech_dump_tools_for_nmx-c/   # Standalone NVOS NMX-C tech dump log-analysis toolkit
-    ├── README.md
-    ├── requirements.txt
-    ├── main.py
-    └── nmx_log_tools/
+├── nvos-tech-dump-tools-for-nmx-c/   # Agent Skill for NVOS / NMX-C NVLSM + Fabric Manager logs
+│   ├── SKILL.md
+│   ├── pyproject.toml                # per-skill uv project (stdlib only — empty deps)
+│   ├── uv.lock
+│   └── scripts/
+│       ├── main.py
+│       └── nmx_log_tools/
+└── doc/                              # Per-skill structure / design docs
+    └── analyze-nv-bug-report-structure.md
 ```
 
 ## Available skills
@@ -33,8 +35,9 @@ Only directories with `SKILL.md` are listed here as Agent Skills.
 | Name | Purpose |
 |---|---|
 | [`analyze-nv-bug-report`](analyze-nv-bug-report/) | Analyze NVIDIA `nvidia-bug-report.sh` log files — extract GPU status, Xid errors, NVLink / IMEX state, and emit a Markdown report (plus a self-contained HTML sidecar). Supports both single-file and multi-node batch comparison. |
+| [`nvos-tech-dump-tools-for-nmx-c`](nvos-tech-dump-tools-for-nmx-c/) | Analyze **NVLSM** + **Fabric Manager** logs under `log/nmx/nmx-c` in an NVOS / NMX-C tech dump (directory or `.tar.gz`) — NVLSM topology / port-state clustering, NVLSM forensics, and a full Fabric Manager (`-vvv`) parse — into a Markdown + HTML report. |
 
-`nvos_tech_dump_tools_for_nmx-c/` is included in this repo as a standalone CLI toolkit for NVOS NMX-C tech dump logs. It is not auto-loaded as an Agent Skill because it does not contain a `SKILL.md`.
+Both skills install the same way (see below). They differ only in dependencies: `analyze-nv-bug-report` pulls a few PyPI packages into its `uv` environment and needs two drop-in NVIDIA Xid assets (step 3); `nvos-tech-dump-tools-for-nmx-c` is **standard-library-only**, so its `uv` environment has no third-party packages — it can even run on any Python 3.9+ without `uv`.
 
 ## Installing a skill
 
@@ -46,7 +49,7 @@ Each skill installs as a directory named after the skill, containing `SKILL.md` 
 | Claude Code | `~/.claude/skills/<skill>/` (global) or `<project>/.claude/skills/<skill>/` (project) | Auto-loaded — global skills available everywhere, project skills only inside that repo. |
 | Codex | `~/.codex/skills/<skill>/` | Auto-loaded — restart Codex session if needed. |
 
-> **Prerequisite:** [`uv`](https://docs.astral.sh/uv/) on your `PATH`. `analyze-nv-bug-report` manages its own Python dependencies through a per-skill `uv` project — `uv` installs a pinned interpreter (Python 3.12) and builds a per-skill `.venv/`, so there is no system-Python requirement and nothing to `pip install` globally. (No `uv`? See the pip fallback in step 5.)
+> **Prerequisite:** [`uv`](https://docs.astral.sh/uv/) on your `PATH`. Each skill manages its own Python environment through a per-skill `uv` project — `uv` installs a pinned interpreter and builds a per-skill `.venv/`, so there is no system-Python requirement and nothing to `pip install` globally. (`nvos-tech-dump-tools-for-nmx-c` is stdlib-only and can also run without `uv` on any Python 3.9+; see step 5.)
 
 ### Steps
 
@@ -79,6 +82,8 @@ mkdir -p ~/.codex/skills     # Codex
 
 Provenance, redistribution policy, and a sanity-check snippet live in [`analyze-nv-bug-report/scripts/third_party/README.md`](analyze-nv-bug-report/scripts/third_party/README.md). If you skip this step the skill still runs, but section §7.2 (Xid Detailed Decode) of the report is skipped with a "Required assets missing" warning.
 
+> `nvos-tech-dump-tools-for-nmx-c` has no third-party assets — skip this step for it.
+
 #### 4. Sync the skill directory with `rsync -aPp`
 
 ```bash
@@ -97,15 +102,14 @@ rsync -aPp ./<skill-name> ~/.codex/skills/
 A `.venv` is not path-portable, so build it **in place** after syncing (do NOT `uv sync` in the clone and rsync it across — create it at the install root):
 
 ```bash
-uv sync --project ~/.claude/skills/analyze-nv-bug-report   # swap the root for Cursor / Codex
+uv sync --project ~/.claude/skills/<skill-name>   # swap the root for Cursor / Codex
 ```
 
-Afterwards the skill runs every script directly through that env — e.g. `~/.claude/skills/analyze-nv-bug-report/.venv/bin/python scripts/analyze.py ...` (its `SKILL.md` does this automatically). It calls `.venv/bin/python` directly, not `uv run`, so no write access to the skill dir is needed at run time.
+Afterwards the skill runs every script directly through that env — e.g. `~/.claude/skills/<skill-name>/.venv/bin/python scripts/<entry>.py ...` (each `SKILL.md` does this automatically). It calls `.venv/bin/python` directly, not `uv run`, so no write access to the skill dir is needed at run time.
 
-> **No `uv`?** Fallback: install the deps into any Python 3.9+ interpreter, then have the skill call that interpreter —
-> ```bash
-> pip install -r requirements.txt
-> ```
+> **No `uv`?**
+> - `analyze-nv-bug-report` needs a few PyPI packages — install them into any Python 3.9+ interpreter and call that interpreter instead: `pip install -r requirements.txt`.
+> - `nvos-tech-dump-tools-for-nmx-c` is **stdlib-only** — skip `uv` entirely and just run it with any Python 3.9+: `python3 ~/.claude/skills/nvos-tech-dump-tools-for-nmx-c/scripts/main.py ...`.
 
 #### 6. (Optional) Register the NVBugs MCP server for `analyze-nv-bug-report`
 
@@ -115,11 +119,11 @@ Step 2.5 of `analyze-nv-bug-report/SKILL.md` can call the `nvbugs_search` tool o
 - **Cursor**: add the server under `mcpServers` in `~/.cursor/mcp.json`.
 - **Codex**: add the server under `mcp_servers` in `~/.codex/config.toml`.
 
-Use the exact server name `user-MaaS NVBugs` so the `SKILL.md` procedure matches.
+Use the exact server name `user-MaaS NVBugs` so the `SKILL.md` procedure matches. (`nvos-tech-dump-tools-for-nmx-c` uses no MCP server — skip this step for it.)
 
 #### 7. Verify in the target tool
 
-Open a new chat in the tool and prompt something matching the skill's description (e.g. "analyze this nv-bug-report.log"). The agent will load the skill and follow its `SKILL.md` workflow.
+Open a new chat in the tool and prompt something matching the skill's description (e.g. "analyze this nv-bug-report.log", or "analyze this NVOS NMX-C dump"). The agent will load the skill and follow its `SKILL.md` workflow.
 
 ---
 
@@ -170,6 +174,19 @@ Open a new chat, drop a log file into the input (or paste its path), and prompt:
 The agent invokes the `analyze-nv-bug-report` skill, runs `scripts/analyze.py` through the skill's own `.venv/bin/python` to produce a Markdown report (plus a self-contained HTML sidecar), and — only when you explicitly ask for NVBugs lookup, Xid errors are present, and the NVBugs MCP server from step 6 is registered — attaches related bugs to the report. NVBugs lookup is **disabled by default**; see [`analyze-nv-bug-report/SKILL.md`](analyze-nv-bug-report/SKILL.md) Step 2.5, and say "search nvbugs" in chat to opt in.
 
 For a deeper walk-through of the internal modules, see [`doc/analyze-nv-bug-report-structure.md`](doc/analyze-nv-bug-report-structure.md).
+
+## Installing `nvos-tech-dump-tools-for-nmx-c`
+
+Same flow, minus the analyze-nv-bug-report-only bits (no step 3 assets, no step 6 MCP):
+
+```bash
+cd ~/repos/LogParserSkill
+mkdir -p ~/.claude/skills
+rsync -aPp ./nvos-tech-dump-tools-for-nmx-c ~/.claude/skills/
+uv sync --project ~/.claude/skills/nvos-tech-dump-tools-for-nmx-c   # stdlib-only env; or skip uv and use any Python 3.9+
+```
+
+Then prompt the agent with something like *"analyze this NVOS NMX-C dump /path/to/nvos_dump.tar.gz"*. The skill runs `scripts/main.py` and writes a Markdown + HTML report to the output directory. See [`nvos-tech-dump-tools-for-nmx-c/SKILL.md`](nvos-tech-dump-tools-for-nmx-c/SKILL.md) for arguments and what the report covers.
 
 ---
 
