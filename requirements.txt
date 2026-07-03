@@ -1,9 +1,15 @@
-# Python dependencies for scripts shipped under skills/<skill>/scripts/.
+# pip fallback dependency list for analyze-nv-bug-report.
 #
-# Required by analyze-nv-bug-report/scripts/third_party/nvidia_xid_analyzer.py
-# (the NVIDIA-provided Xid decoder invoked as a subprocess by
-# analyze-nv-bug-report). Skills' own modular code (e.g. nvbug_report/*)
-# uses only the Python standard library and needs no extra packages.
+# The primary install path is the per-skill uv project
+# (analyze-nv-bug-report/pyproject.toml + uv.lock); `uv sync` installs these
+# automatically. Use this file only when uv is unavailable:
+#     pip install -r requirements.txt
+#
+# - tabulate / pandas / openpyxl / pytz / tzlocal / python-dateutil: required by
+#   the NVIDIA-provided Xid decoder (analyze-nv-bug-report/scripts/third_party/
+#   nvidia_xid_analyzer.py), invoked as a subprocess by analyze-nv-bug-report.
+# - markdown: required by scripts/nvbug_report/html_renderer.py for the HTML sidecar.
+# Everything else in nvbug_report/* uses only the Python standard library.
 #
 # Python: 3.9+ (uses zoneinfo from stdlib).
 
@@ -13,3 +19,4 @@ openpyxl
 pytz
 tzlocal
 python-dateutil
+markdown

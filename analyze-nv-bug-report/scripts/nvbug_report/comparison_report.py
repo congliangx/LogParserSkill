@@ -102,7 +102,7 @@ def generate_comparison_report(all_results, output_dir):
 
             hosts_in_burst = sorted(set(e["hostname"] for e in burst))
             host_label = ", ".join(hosts_in_burst)
-            summary = f"Event {idx_b + 1}: {ts_label} [{host_label}] ({len(burst)} entries)"
+            summary = f"Event Group {idx_b + 1}: {ts_label} [{host_label}] ({len(burst)} entries)"
             r.append("<details>")
             r.append(f"<summary>{summary}</summary>")
             r.append("")
@@ -309,9 +309,9 @@ def generate_comparison_report(all_results, output_dir):
                 count_label = f"{len(burst)} entries"
 
             if ts_first == ts_last:
-                summary = f"Event {idx_b + 1}: {ts_first} [{host_label}] ({count_label})"
+                summary = f"Event Group {idx_b + 1}: {ts_first} [{host_label}] ({count_label})"
             else:
-                summary = f"Event {idx_b + 1}: {ts_first} ~ {ts_last} [{host_label}] ({count_label})"
+                summary = f"Event Group {idx_b + 1}: {ts_first} ~ {ts_last} [{host_label}] ({count_label})"
             r.append(f"<details>")
             r.append(f"<summary>{summary}</summary>")
             r.append("")
@@ -430,11 +430,11 @@ def generate_comparison_report(all_results, output_dir):
         r.append("Only one node, cross-node comparison not applicable.")
 
     if imex_xid_correlations:
-        r.append("- **IMEX-Xid Event Correlation**:")
+        r.append("- **IMEX-Xid Event Group Correlation**:")
         for xid_ev, xid_ts, imex_list in imex_xid_correlations:
             for ie_num, ie_ts in imex_list:
                 r.append(
-                    f"  - IMEX Event {ie_num} ({ie_ts}) <-> Xid Event {xid_ev} ({xid_ts})")
+                    f"  - IMEX Event Group {ie_num} ({ie_ts}) <-> Xid Event Group {xid_ev} ({xid_ts})")
 
     report_text = "\n".join(r)
     _analyze_stat_line(

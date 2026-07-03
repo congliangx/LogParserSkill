@@ -1,0 +1,8 @@
+version = 1
+revision = 3
+requires-python = ">=3.9"
+
+[[package]]
+name = "nvos-tech-dump-tools-for-nmx-c"
+version = "0.1.0"
+source = { virtual = "." }
