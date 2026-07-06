@@ -1,0 +1,9 @@
+[project]
+name = "correlation-xid"
+version = "0.1.0"
+description = "Time-correlate compute-tray nv-bug-report reports with NVOS/NMX-C dump reports (Xid / IMEX vs port-state / Fabric Manager) into one rack correlation report."
+requires-python = ">=3.9"
+# Standard library only — no third-party runtime dependencies. The uv project
+# exists to pin a Python interpreter and build a per-skill .venv/, matching the
+# other skills in this repo (so the same install flow works for all of them).
+dependencies = []
