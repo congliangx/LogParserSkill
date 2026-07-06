@@ -24,6 +24,13 @@ LogParserSkill/
 │   └── scripts/
 │       ├── main.py
 │       └── nmx_log_tools/
+├── correlation-xid/                  # Agent Skill: time-correlate nv-bug-report + NVOS reports
+│   ├── SKILL.md
+│   ├── pyproject.toml                # per-skill uv project (stdlib only — empty deps)
+│   ├── uv.lock
+│   └── scripts/
+│       ├── correlate.py
+│       └── correlation_xid/
 └── doc/                              # Per-skill structure / design docs
     └── analyze-nv-bug-report-structure.md
 ```
@@ -36,8 +43,9 @@ Only directories with `SKILL.md` are listed here as Agent Skills.
 |---|---|
 | [`analyze-nv-bug-report`](analyze-nv-bug-report/) | Analyze NVIDIA `nvidia-bug-report.sh` log files — extract GPU status, Xid errors, NVLink / IMEX state, and emit a Markdown report (plus a self-contained HTML sidecar). Supports both single-file and multi-node batch comparison. |
 | [`nvos-tech-dump-tools-for-nmx-c`](nvos-tech-dump-tools-for-nmx-c/) | Analyze **NVLSM** + **Fabric Manager** logs under `log/nmx/nmx-c` in an NVOS / NMX-C tech dump (directory or `.tar.gz`) — NVLSM topology / port-state clustering, NVLSM forensics, and a full Fabric Manager (`-vvv`) parse — into a Markdown + HTML report. |
+| [`correlation-xid`](correlation-xid/) | **Time-correlate** the reports of the other two skills: match compute-tray Xid / IMEX event groups against switch-side port-state event groups and Fabric Manager highlights in the same time window (handling a timezone offset between the two capture sources), scoped per chassis, into one rack correlation report. |
 
-Both skills install the same way (see below). They differ only in dependencies: `analyze-nv-bug-report` pulls a few PyPI packages into its `uv` environment and needs two drop-in NVIDIA Xid assets (step 3); `nvos-tech-dump-tools-for-nmx-c` is **standard-library-only**, so its `uv` environment has no third-party packages — it can even run on any Python 3.9+ without `uv`.
+All three skills install the same way (see below). They differ only in dependencies: `analyze-nv-bug-report` pulls a few PyPI packages into its `uv` environment and needs two drop-in NVIDIA Xid assets (step 3); `nvos-tech-dump-tools-for-nmx-c` and `correlation-xid` are **standard-library-only**, so their `uv` environments have no third-party packages — they can even run on any Python 3.9+ without `uv`. `correlation-xid` reads the *reports* produced by the other two skills, so run those first.
 
 ## Installing a skill
 
@@ -82,7 +90,7 @@ mkdir -p ~/.codex/skills     # Codex
 
 Provenance, redistribution policy, and a sanity-check snippet live in [`analyze-nv-bug-report/scripts/third_party/README.md`](analyze-nv-bug-report/scripts/third_party/README.md). If you skip this step the skill still runs, but section §7.2 (Xid Detailed Decode) of the report is skipped with a "Required assets missing" warning.
 
-> `nvos-tech-dump-tools-for-nmx-c` has no third-party assets — skip this step for it.
+> `nvos-tech-dump-tools-for-nmx-c` and `correlation-xid` have no third-party assets — skip this step for them.
 
 #### 4. Sync the skill directory with `rsync -aPp`
 
@@ -109,7 +117,7 @@ Afterwards the skill runs every script directly through that env — e.g. `~/.cl
 
 > **No `uv`?**
 > - `analyze-nv-bug-report` needs a few PyPI packages — install them into any Python 3.9+ interpreter and call that interpreter instead: `pip install -r requirements.txt`.
-> - `nvos-tech-dump-tools-for-nmx-c` is **stdlib-only** — skip `uv` entirely and just run it with any Python 3.9+: `python3 ~/.claude/skills/nvos-tech-dump-tools-for-nmx-c/scripts/main.py ...`.
+> - `nvos-tech-dump-tools-for-nmx-c` and `correlation-xid` are **stdlib-only** — skip `uv` entirely and just run them with any Python 3.9+ (e.g. `python3 ~/.claude/skills/correlation-xid/scripts/correlate.py ...`).
 
 #### 6. (Optional) Register the NVBugs MCP server for `analyze-nv-bug-report`
 
