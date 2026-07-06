@@ -14,15 +14,18 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from . import timeutil as T
-from .models import Event, SwitchNode, SwitchReport, TrayReport
+from .models import CrossNodeReport, Event, SwitchNode, SwitchReport, TrayReport
 
 NVBUG_TITLE = "# NVIDIA Bug Report Analysis"
 NVOS_TITLE = "# NMX-C Log Analysis Report"
+NVBUG_CROSS_TITLE = "# Multi-Node Xid Comparison Report"
 
 
 def classify(text: str) -> Optional[str]:
-    """Return 'nvbug', 'nvos', or None from a report's leading lines."""
+    """Return 'nvbug', 'nvbug_cross', 'nvos', or None from a report's leading lines."""
     head = text[:2000]
+    if NVBUG_CROSS_TITLE in head:
+        return "nvbug_cross"
     if NVBUG_TITLE in head:
         return "nvbug"
     if NVOS_TITLE in head:
@@ -250,14 +253,47 @@ def _parse_nvos_port_state(node: SwitchNode, section: str) -> None:
         block = region[m.end():blk_end]
         ad = len(re.findall(r"ACTIVE→DOWN", block))
         di = len(re.findall(r"DOWN→INIT", block))
+        fm_header, fm_rows, fm_total = _parse_fm_table(block)
         node.port_state_events.append(Event(
             source_kind="switch", source_id=node.hostname or node.title[:24],
             chassis=node.chassis, kind="port_state", start=start, end=end or start,
             label=f"port-state group [{severity}]",
             detail=f"ACTIVE→DOWN x{ad}, DOWN→INIT x{di}",
-            ref=f"Port state event group {gid}",
-            extra={"severity": severity},
+            ref=f"nvos event group {gid}",
+            extra={"severity": severity, "fm_header": fm_header,
+                   "fm_rows": fm_rows, "fm_total": fm_total},
         ))
+
+
+def _parse_fm_table(block: str):
+    """Extract the nested 'Fabric Manager log (same time window)' markdown table
+    from one port-state event-group block. Returns (header, rows, total) where
+    rows is [(cells, count)] deduped by identical full row, first-seen order."""
+    mi = block.find("Fabric Manager log")
+    if mi < 0:
+        return [], [], 0
+    lines = [ln for ln in block[mi:].splitlines() if ln.lstrip().startswith("|")]
+    if len(lines) < 2:
+        return [], [], 0
+
+    def cells(ln: str) -> List[str]:
+        return [c.strip() for c in ln.strip().strip("|").split("|")]
+
+    header = cells(lines[0])
+    counts: dict = {}
+    order: List[tuple] = []
+    total = 0
+    for ln in lines[1:]:
+        cv = cells(ln)
+        if cv and all(re.fullmatch(r"[-: ]*", c) for c in cv):   # separator row
+            continue
+        total += 1
+        key = tuple(cv)
+        if key not in counts:
+            counts[key] = 0
+            order.append(key)
+        counts[key] += 1
+    return header, [(list(k), counts[k]) for k in order], total
 
 
 def _sev_of(marker: str) -> str:
@@ -283,10 +319,12 @@ def _parse_nvos_fnm(node: SwitchNode, section: str) -> None:
                     (r"^## ",))
     if not region:
         return
-    # FNM port loss table rows: | FM Time | node GUID | port | in_nvlsm | host | down | ... |
+    # FNM port loss table: | FM Time | GUID | port | in_nvlsm | host | Down |
+    #                       Recovered? | Recovered Time | line num |
     for m in re.finditer(
         r"^\|\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\|\s*`?([^|`]+?)`?\s*\|"
-        r"\s*(\d+)\s*\|\s*([A-Za-z-]+)\s*\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|",
+        r"\s*(\d+)\s*\|\s*([A-Za-z-]+)\s*\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|"
+        r"(?:\s*([A-Za-z-]*)\s*\|\s*([^|]*?)\s*\|)?",
         region, re.M,
     ):
         ts = T.parse_full(m.group(1))
@@ -294,24 +332,109 @@ def _parse_nvos_fnm(node: SwitchNode, section: str) -> None:
             continue
         guid, port, in_nvlsm, host, down = (m.group(2).strip(), m.group(3),
                                             m.group(4), m.group(5).strip(), m.group(6).strip())
+        recovered = (m.group(8) or "").strip()
         node.fnm_events.append(Event(
             source_kind="switch", source_id=node.hostname or node.title[:24],
             chassis=node.chassis, kind="fnm_port_loss", start=ts, end=ts,
             label=f"FNM port {port} loss ({down or '-'})",
             detail=f"node GUID {guid}; peer host {host or '-'}",
             ref="Other FM Highlights / FNM port loss",
-            extra={"port": port, "peer_host": host, "guid": guid},
+            extra={"port": port, "peer_host": host, "guid": guid,
+                   "down": down, "recovered": recovered},
         ))
+
+
+_XREF_GRP_RE = re.compile(
+    r"Event Group (\d+):\s*"
+    r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"                               # start (full)
+    r"(?:\s*~\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}|\d{2}:\d{2}:\d{2}))?"  # optional end
+)
+
+
+def _xref_end(e_raw: Optional[str], start: datetime) -> datetime:
+    if not e_raw:
+        return start
+    full = T.parse_full(e_raw)
+    if full:
+        return full
+    m = re.match(r"^(\d{2}):(\d{2}):(\d{2})$", e_raw)  # time-only -> same date
+    if m:
+        end = start.replace(hour=int(m.group(1)), minute=int(m.group(2)),
+                            second=int(m.group(3)))
+        if end < start:
+            end += timedelta(days=1)
+        return end
+    return start
+
+
+def _xref_groups(region: str) -> List[Tuple[int, datetime, datetime]]:
+    out: List[Tuple[int, datetime, datetime]] = []
+    for m in _XREF_GRP_RE.finditer(region):
+        gid, s_raw, e_raw = m.groups()
+        s = T.parse_full(s_raw)
+        if not s:
+            continue
+        out.append((int(gid), s, _xref_end(e_raw, s)))
+    return out
+
+
+def _distinct_xids(block: str) -> List[Tuple[str, str, str, str]]:
+    """From one cross-node Xid event-group block's raw-log table, return distinct
+    ``(xid, mnemonic, severity, example)`` — deduped across nodes (first NVRM line
+    per signature kept, syslog prefix stripped so it is node-agnostic)."""
+    out: List[Tuple[str, str, str, str]] = []
+    seen = set()
+    for lm in _XID_LINE_RE.finditer(block):
+        _bdf, xid, mnem, sev = lm.groups()
+        key = (xid, mnem or "", sev or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        end_bt = block.find("`", lm.start())
+        ex = block[lm.start():end_bt] if end_bt != -1 else block[lm.start():lm.end()]
+        out.append((xid, mnem or "", sev or "", " ".join(ex.split())))
+    return out
+
+
+def _parse_xref_xid_timeline(region: str):
+    """Return (groups, details) for §4: groups=[(gid,start,end)],
+    details={gid: [(xid, mnemonic, severity, example), ...]}."""
+    groups: List[Tuple[int, datetime, datetime]] = []
+    details: Dict[int, List[Tuple[str, str, str, str]]] = {}
+    matches = list(_XREF_GRP_RE.finditer(region))
+    for i, m in enumerate(matches):
+        gid_s, s_raw, e_raw = m.groups()
+        s = T.parse_full(s_raw)
+        if not s:
+            continue
+        gid = int(gid_s)
+        groups.append((gid, s, _xref_end(e_raw, s)))
+        blk_end = matches[i + 1].start() if i + 1 < len(matches) else len(region)
+        details[gid] = _distinct_xids(region[m.end():blk_end])
+    return groups, details
+
+
+def parse_nvbug_cross(path: str, text: str) -> CrossNodeReport:
+    """Parse the nv-bug-report cross-node comparison report's merged timelines
+    (§2 IMEX Node Disconnect Timeline, §4 Xid Unified Timeline)."""
+    rep = CrossNodeReport(path=path)
+    rep.imex_groups = _xref_groups(
+        _slice(text, r"^## 2\. IMEX Node Disconnect Timeline", (r"^## 3\.",)))
+    rep.xid_groups, rep.xid_details = _parse_xref_xid_timeline(
+        _slice(text, r"^## 4\. Xid Unified Timeline", (r"^## 5\.",)))
+    return rep
 
 
 def parse_report(path: str):
     """Parse one report file; return ('nvbug', TrayReport) / ('nvos', SwitchReport)
-    / (None, None)."""
+    / ('nvbug_cross', CrossNodeReport) / (None, None)."""
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         text = f.read()
     kind = classify(text)
     if kind == "nvbug":
         return kind, parse_nvbug(path, text)
+    if kind == "nvbug_cross":
+        return kind, parse_nvbug_cross(path, text)
     if kind == "nvos":
         return kind, parse_nvos(path, text)
     return None, None

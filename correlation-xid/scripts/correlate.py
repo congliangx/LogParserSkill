@@ -19,13 +19,12 @@ Inputs may be individual report .md files and/or directories (scanned for
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 from typing import List
 
 from correlation_xid.engine import correlate, gather_compute, gather_switch, suggest_offsets
-from correlation_xid.models import SwitchReport, TrayReport
+from correlation_xid.models import CrossNodeReport, SwitchReport, TrayReport
 from correlation_xid.parsers import parse_report
 from correlation_xid.render import build_report
 
@@ -68,14 +67,23 @@ def main(argv=None) -> int:
 
     trays: List[TrayReport] = []
     switches: List[SwitchReport] = []
+    crosses: List[CrossNodeReport] = []
     for path in _discover_md(args.input):
         kind, rep = parse_report(path)
         if kind == "nvbug":
             trays.append(rep)
         elif kind == "nvos":
             switches.append(rep)
-    print(f"Parsed {len(trays)} nv-bug-report(s) and {len(switches)} NVOS dump report(s).",
-          file=sys.stderr)
+        elif kind == "nvbug_cross":
+            crosses.append(rep)
+    cross = None
+    if crosses:
+        cross = crosses[0]
+        for c in crosses[1:]:  # multi-rack: merge the timelines
+            cross.xid_groups.extend(c.xid_groups)
+            cross.imex_groups.extend(c.imex_groups)
+    print(f"Parsed {len(trays)} nv-bug-report(s), {len(switches)} NVOS dump report(s), "
+          f"{len(crosses)} cross-node report(s).", file=sys.stderr)
     if not trays or not switches:
         print("Error: need at least one nv-bug-report AND one NVOS dump report to correlate.",
               file=sys.stderr)
@@ -97,7 +105,7 @@ def main(argv=None) -> int:
     res = correlate(trays, switches, offset_min=offset,
                     window_s=args.window_seconds, scoped=scoped)
 
-    doc = build_report(res, trays, switches, auto_tz=args.auto_tz)
+    doc = build_report(res, trays, switches, auto_tz=args.auto_tz, cross=cross)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     md_path = args.output_dir / f"{args.name}.md"
     html_path = args.output_dir / f"{args.name}.html"

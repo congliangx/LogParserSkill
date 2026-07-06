@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -74,3 +74,19 @@ class SwitchNode:
 
     def all_events(self) -> List[Event]:
         return self.port_state_events + self.fnm_events
+
+
+@dataclass
+class CrossNodeReport:
+    """Parsed nv-bug-report cross-node comparison report (aggregate).
+
+    Holds the merged timeline event groups so the correlation can cite the
+    cross-node Xid / IMEX event-group numbers instead of the per-node ones.
+    Each group is ``(gid, start, end)``.
+    """
+
+    path: str
+    xid_groups: List[Tuple[int, datetime, datetime]] = field(default_factory=list)
+    imex_groups: List[Tuple[int, datetime, datetime]] = field(default_factory=list)
+    # {xid_gid: [(xid, mnemonic, severity, example_nvrm_line), ...]} — node-deduped
+    xid_details: Dict[int, List[Tuple[str, str, str, str]]] = field(default_factory=dict)

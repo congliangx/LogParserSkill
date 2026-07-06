@@ -8,7 +8,7 @@ JS for sortable/filterable tables and expand/collapse-all, so it opens offline.
 from __future__ import annotations
 
 from html import escape as _esc
-from typing import List, Tuple
+from typing import List, Optional
 
 from . import timeutil as T
 from .engine import Result
@@ -173,20 +173,92 @@ def _fmt_off(mins: int) -> str:
     return f"{sign}{a // 60:02d}:{a % 60:02d} ({mins:+d} min)"
 
 
+FM_ROW_CAP = 50
+_FM_SLIM = [("Time", "Time"), ("Level", "Level"), ("Category", "Category"),
+            ("GPU GUID", "GPU GUID"), ("Compute Slot Idx", "Cmp Slot"),
+            ("Detail", "Detail")]   # (source header name, display name)
+
+
+def _fm_slim_rows(ev, cap: int = FM_ROW_CAP):
+    """Project a port_state Event's FM table (Event.extra) onto the slim column
+    set, re-aggregate identical slim rows with a ×count, sort by count desc.
+    Returns (display_headers, rows, unique, total) or None if no FM table."""
+    hdr = ev.extra.get("fm_header") or []
+    raw = ev.extra.get("fm_rows") or []
+    if not raw:
+        return None
+    idx = [hdr.index(src) if src in hdr else -1 for src, _ in _FM_SLIM]
+    agg: dict = {}
+    order: List[tuple] = []
+    for cells, cnt in raw:
+        key = tuple(cells[i] if 0 <= i < len(cells) else "-" for i in idx)
+        if key not in agg:
+            agg[key] = 0
+            order.append(key)
+        agg[key] += cnt
+    order.sort(key=lambda k: -agg[k])
+    disp = [d for _, d in _FM_SLIM] + ["×"]
+    rows = [list(k) + [str(agg[k])] for k in order[:cap]]
+    return disp, rows, len(order), ev.extra.get("fm_total", 0)
+
+
+def _xref(cross, kind: str, dt, tol: int = 120) -> Optional[int]:
+    """Cross-node event-group id whose [start,end] best matches dt (same kind).
+    Nearest-match falls back within ``tol`` seconds (the correlation window)."""
+    if cross is None:
+        return None
+    groups = cross.xid_groups if kind == "xid" else cross.imex_groups
+    best, bestd = None, None
+    for gid, s, e in groups:
+        if s <= dt <= e:
+            return gid
+        d = min(abs((dt - s).total_seconds()), abs((dt - e).total_seconds()))
+        if bestd is None or d < bestd:
+            best, bestd = gid, d
+    return best if (bestd is not None and bestd <= tol) else None
+
+
+def _fnm_hits(fnm_all, sw, window_s: int):
+    """FNM port-loss events on the same switch whose loss time is within window_s
+    of the fabric group's [start, end] (both are switch-side / same clock)."""
+    out = []
+    for e in fnm_all:
+        if e.source_id != sw.source_id:
+            continue
+        if e.start < sw.start:
+            gap = (sw.start - e.start).total_seconds()
+        elif e.start > sw.end:
+            gap = (e.start - sw.end).total_seconds()
+        else:
+            gap = 0
+        if gap <= window_s:
+            out.append(e)
+    return out
+
+
 def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchReport],
-                 auto_tz: bool) -> Doc:
+                 auto_tz: bool, cross=None) -> Doc:
     d = Doc("Xid ↔ NVOS Correlation Report")
 
-    n_xid = sum(len(t.xid_events) for t in trays)
-    n_imex = sum(len(t.imex_events) for t in trays)
     n_ps = sum(len(n.port_state_events) for s in switches for n in s.nodes)
     n_fnm = sum(len(n.fnm_events) for s in switches for n in s.nodes)
     chassis = sorted({t.chassis_sn for t in trays if t.chassis_sn}
                      | {n.chassis for s in switches for n in s.nodes if n.chassis})
 
+    if cross is not None:
+        # Match the cross-node report's merged timelines (what §2 now cites).
+        compute_line = (f"Compute trays (nv-bug-report): {len(trays)} — cross-node Xid event "
+                        f"groups: {len(cross.xid_groups)}, IMEX event groups: "
+                        f"{len(cross.imex_groups)}")
+    else:
+        n_xid = sum(len(t.xid_events) for t in trays)
+        n_imex = sum(len(t.imex_events) for t in trays)
+        compute_line = (f"Compute trays (nv-bug-report): {len(trays)} — per-node Xid event "
+                        f"groups: {n_xid}, IMEX event groups: {n_imex} (no cross-node report)")
+
     d.bullets([
-        f"Compute trays (nv-bug-report): {len(trays)} — Xid event groups: {n_xid}, IMEX event groups: {n_imex}",
-        f"Switch dumps (NVOS/NMX-C): {len(switches)} — port-state event groups: {n_ps}, FNM port-loss events: {n_fnm}",
+        compute_line,
+        f"Switch dumps (NVOS/NMX-C): {len(switches)} — nvos event groups: {n_ps}, FNM port-loss events: {n_fnm}",
         f"Chassis (rack) key(s): {', '.join(chassis) if chassis else '(none detected)'}",
         f"Correlation window: ±{res.window_s}s | Timezone offset applied to switch side: {_fmt_off(res.offset_min)}"
         + ("  [auto-selected]" if auto_tz else ""),
@@ -197,11 +269,13 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
     d.h(2, "1. Timezone Alignment")
     d.p("Both report families stamp events in local wall-clock time with no timezone "
         "marker, so the switch side is shifted by an offset before matching. The table "
-        "below sweeps candidate offsets and scores each by how many compute↔switch event "
-        "starts fall within the correlation window; re-run with --tz-offset-minutes "
-        "(or --auto-tz) to apply the best one.", note=True)
+        "below shows the top-scoring candidate offsets (scored by how many compute↔switch "
+        "event starts align); re-run with --tz-offset-minutes (or --auto-tz) to apply one.",
+        note=True)
     if res.suggestions:
-        top = res.suggestions[:10]
+        top = res.suggestions[:3]
+        if all(off != res.offset_min for off, _ in top):  # always keep the applied offset
+            top = top + [s for s in res.suggestions if s[0] == res.offset_min][:1]
         rows = [[_fmt_off(off), str(hits), "◀ applied" if off == res.offset_min else
                  ("best" if (off, hits) == res.suggestions[0] else "")]
                 for off, hits in top]
@@ -211,63 +285,149 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
 
     # 2. Correlated events
     d.h(2, "2. Correlated Events")
+    corr_xid_egs: set = set()   # cross-node Xid EG ids cited by any fabric group
+    corr_imex_egs: set = set()  # cross-node IMEX EG ids cited by any fabric group
     if res.correlations:
-        d.p(f"{len(res.correlations)} compute-tray event(s) have ≥1 time-overlapping "
-            f"switch event (within ±{res.window_s}s at the applied offset).")
-        rows = []
+        # Invert compute→switch into switch→[compute]: one fold per switch (nvos)
+        # event, cross-referenced to the nvbr cross-node report's event groups.
+        # Fold only on port-state fabric groups; a matched FNM is surfaced inside the
+        # time-aligned fold (via _fnm_hits below), never as its own fold.
+        groups: dict = {}
         for c in res.correlations:
-            ce = c.compute
-            sw_hosts = sorted({s.source_id for s, _ in c.switches})
-            rows.append([
-                T.fmt(ce.start), ce.kind.upper(), ce.source_id, ce.label,
-                str(len(c.switches)), ", ".join(sw_hosts), ce.ref,
-            ])
-        d.table(["Compute time", "Kind", "Tray", "Compute event",
-                 "# switch", "Switch host(s)", "Ref"], rows)
-        # Details per correlation
-        for c in res.correlations:
-            ce = c.compute
-            is_xid = ce.kind == "xid"
-            d.details_open(
-                f"{ce.kind.upper()} @ {T.fmt(ce.start)}–{T.fmt(ce.end)} [{ce.source_id}] "
-                f"— {ce.label} ↔ {len(c.switches)} switch event(s)", red=is_xid)
-            srows = []
             for s, delta in c.switches:
-                srows.append([T.fmt(s.start), T.fmt(T.shift(s.start, res.offset_min)),
-                              f"{delta}s", s.kind, s.source_id, s.chassis or "-",
-                              s.label, s.detail, s.ref])
-            d.table(["Switch time (raw)", "Switch time (shifted)", "Δ", "Kind", "Switch",
-                     "Chassis", "Event", "Detail", "Ref"], srows)
-            if ce.detail:
-                d.p(f"compute-side note: {ce.detail}", note=True)
+                if s.kind != "port_state":
+                    continue
+                key = (s.source_id, s.ref, s.kind, s.start)
+                g = groups.get(key)
+                if g is None:
+                    g = {"sw": s, "rows": []}
+                    groups[key] = g
+                g["rows"].append((c.compute, delta))
+        ordered = sorted(groups.values(), key=lambda g: g["sw"].start)
+        # Coverage is counted from what the folds actually DISPLAY, so the numbers
+        # match the report body exactly. A fold is one port-state fabric event that
+        # correlated with compute-tray Xid/IMEX; the FNM shown inside it is
+        # switch-side context (see _fnm_hits: same-clock proximity to the port-state
+        # group), NOT the engine's separate offset-based switch↔compute FNM match —
+        # counting the two from one source keeps them from disagreeing.
+        fnm_all = [e for s in switches for n in s.nodes for e in n.fnm_events]
+        fnm_shown_ids = {id(e) for g in ordered
+                         for e in _fnm_hits(fnm_all, g["sw"], res.window_s)}
+        d.p(f"{len(ordered)} of {n_ps} port-state event group(s) correlated with "
+            f"compute-tray Xid/IMEX (within ±{res.window_s}s at the applied offset); "
+            f"the remaining {n_ps - len(ordered)} had no compute-side Xid/IMEX in the "
+            f"same window (routine port flaps). {len(fnm_shown_ids)} FNM port-loss "
+            f"event(s) are surfaced as switch-side context within the folds below.")
+        d.p("Each fold is one port-state fabric event, cross-referenced to the nvbr "
+            "cross-node report's Xid / IMEX event group(s), with a node-deduped Xid "
+            "raw-log summary, any FNM port-loss events in the same switch-side window, "
+            "and the matching Fabric Manager log (nested, collapsed).", note=True)
+        if cross is None:
+            d.p("nvbr cross-node report not found among the inputs — folds fall back to "
+                "compute-event counts instead of cross-node event-group numbers.", note=True)
+        for g in ordered:
+            sw = g["sw"]
+            comp_rows = g["rows"]
+            is_xid = any(ce.kind == "xid" for ce, _ in comp_rows)
+            sev = sw.extra.get("severity")
+            sev_tag = f"[{sev}] " if sev else ""
+            xid_egs = sorted({_xref(cross, "xid", ce.start, res.window_s)
+                              for ce, _ in comp_rows if ce.kind == "xid"} - {None})
+            imex_egs = sorted({_xref(cross, "imex", ce.start, res.window_s)
+                               for ce, _ in comp_rows if ce.kind == "imex"} - {None})
+            corr_xid_egs.update(xid_egs)
+            corr_imex_egs.update(imex_egs)
+            parts = []
+            if xid_egs:
+                parts.append("Xid Event Group " + ", ".join(str(i) for i in xid_egs))
+            if imex_egs:
+                parts.append("IMEX Event Group " + ", ".join(str(i) for i in imex_egs))
+            xref = ("nvbr " + "; ".join(parts)) if parts else f"{len(comp_rows)} compute event(s)"
+            d.details_open(
+                f"{sw.ref} {sev_tag}@ {T.fmt(T.shift(sw.start, res.offset_min))} "
+                f"(switch raw {T.fmt(sw.start)}) ↔ {xref}", red=is_xid)
+            if cross is not None and xid_egs:
+                seen = set()
+                xrows = []
+                for gid in xid_egs:
+                    for xid, mnem, sev_x, ex in cross.xid_details.get(gid, []):
+                        key = (xid, mnem, sev_x)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        xrows.append([xid, mnem or "-", sev_x or "-", ex])
+                if xrows:
+                    d.p("Xid raw log (cross-node Xid Event Group "
+                        + ", ".join(str(i) for i in xid_egs) + ", deduped across nodes):")
+                    d.table(["Xid", "Mnemonic", "Severity", "Example NVRM raw log"], xrows)
+            fnm = _fnm_hits(fnm_all, sw, res.window_s)
+            if fnm:
+                fnm = sorted(fnm, key=lambda e: e.start)
+                frows = [[T.fmt(e.start), e.extra.get("port", "-"),
+                          e.extra.get("down", "") or "-",
+                          e.extra.get("peer_host", "") or "-",
+                          e.extra.get("recovered", "") or "-"]
+                         for e in fnm[:FM_ROW_CAP]]
+                d.p(f"FNM port loss (nvos Other FabricManager Log Highlights, within "
+                    f"±{res.window_s}s):")
+                d.table(["FM Time", "Port", "Transition", "Peer host", "Recovered"], frows)
+                if len(fnm) > FM_ROW_CAP:
+                    d.p(f"… +{len(fnm) - FM_ROW_CAP} more FNM event(s) suppressed", note=True)
+            fm = _fm_slim_rows(sw)
+            if fm:
+                disp, frows, unique, total = fm
+                d.details_open(f"Fabric Manager log — {sw.ref} (same time window): "
+                               f"{unique} unique / {total} rows")
+                d.table(disp, frows)
+                if unique > FM_ROW_CAP:
+                    d.p(f"… +{unique - FM_ROW_CAP} more unique FM row(s) suppressed", note=True)
+                d.details_close()
             d.details_close()
     else:
         d.p("No compute-tray event correlated with any switch event at the applied "
             "offset. Check the Timezone Alignment table above for a better offset.", note=True)
 
-    # 3. Unmatched compute events (Xid highlighted)
+    # 3. Uncorrelated compute events — as cross-node event groups when available
     d.h(2, "3. Uncorrelated Compute-Tray Events")
-    unmatched_xid = [e for e in res.unmatched_compute if e.kind == "xid"]
-    unmatched_imex = [e for e in res.unmatched_compute if e.kind == "imex"]
-    d.p(f"Xid groups with no switch correlation: {len(unmatched_xid)} | "
-        f"IMEX groups with no switch correlation: {len(unmatched_imex)}")
-    if res.unmatched_compute:
-        rows = [[T.fmt(e.start), T.fmt(e.end), e.kind.upper(), e.source_id,
-                 e.chassis or "-", e.label, e.ref]
-                for e in sorted(res.unmatched_compute, key=lambda x: (x.kind != "xid", x.start))]
-        d.details_open(f"{len(res.unmatched_compute)} uncorrelated compute event(s)")
-        d.table(["Start", "End", "Kind", "Tray", "Chassis", "Event", "Ref"], rows)
-        d.details_close()
+    if cross is not None:
+        d.p("Cross-node event groups (nvbr cross-node report) that did NOT time-correlate "
+            "with any switch fabric event in §2 (cross-node granularity).")
+        un_xid = [g for g in sorted(cross.xid_groups) if g[0] not in corr_xid_egs]
+        xid_sum = (f"Xid: {len(un_xid)} of {len(cross.xid_groups)} cross-node Xid Event "
+                   f"Group(s) uncorrelated")
+        if un_xid:
+            rows = []
+            for gid, s, e in un_xid:
+                xids = "; ".join(
+                    " ".join(p for p in (f"Xid {xid}", mnem, sev) if p)
+                    for xid, mnem, sev, _ex in cross.xid_details.get(gid, []))
+                rows.append([f"Xid Event Group {gid}", T.fmt(s), T.fmt(e), xids or "-"])
+            d.details_open(xid_sum)
+            d.table(["nvbr ref", "Start", "End", "Xid types"], rows)
+            d.details_close()
+        else:
+            d.p(xid_sum + ".")
+        un_imex = [g for g in sorted(cross.imex_groups) if g[0] not in corr_imex_egs]
+        imex_sum = (f"IMEX: {len(un_imex)} of {len(cross.imex_groups)} cross-node IMEX Event "
+                    f"Group(s) uncorrelated")
+        if un_imex:
+            rows = [[f"IMEX Event Group {gid}", T.fmt(s), T.fmt(e)] for gid, s, e in un_imex]
+            d.details_open(imex_sum)
+            d.table(["nvbr ref", "Start", "End"], rows)
+            d.details_close()
+        else:
+            d.p(imex_sum + ".")
+    else:
+        unmatched_xid = [e for e in res.unmatched_compute if e.kind == "xid"]
+        unmatched_imex = [e for e in res.unmatched_compute if e.kind == "imex"]
+        d.p(f"Xid groups with no switch correlation: {len(unmatched_xid)} | "
+            f"IMEX groups with no switch correlation: {len(unmatched_imex)}")
+        if res.unmatched_compute:
+            rows = [[T.fmt(e.start), T.fmt(e.end), e.kind.upper(), e.source_id,
+                     e.chassis or "-", e.label, e.ref]
+                    for e in sorted(res.unmatched_compute, key=lambda x: (x.kind != "xid", x.start))]
+            d.details_open(f"{len(res.unmatched_compute)} uncorrelated compute event(s)")
+            d.table(["Start", "End", "Kind", "Tray", "Chassis", "Event", "Ref"], rows)
+            d.details_close()
 
-    # 4. Switch coverage
-    d.h(2, "4. Switch Event Coverage")
-    d.p(f"Switch events correlated to a compute event: {len(res.matched_switch)} / "
-        f"{res.total_switch}. (Unmatched switch events are typically routine port "
-        "flaps with no compute-tray Xid/IMEX in the same window.)")
-    if res.matched_switch:
-        rows = [[T.fmt(e.start), e.kind, e.source_id, e.chassis or "-", e.label, e.detail, e.ref]
-                for e in sorted(res.matched_switch, key=lambda x: x.start)]
-        d.details_open(f"{len(res.matched_switch)} correlated switch event(s)")
-        d.table(["Switch time (raw)", "Kind", "Switch", "Chassis", "Event", "Detail", "Ref"], rows)
-        d.details_close()
     return d
