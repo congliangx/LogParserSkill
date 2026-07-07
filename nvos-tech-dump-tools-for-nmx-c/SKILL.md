@@ -1,6 +1,6 @@
 ---
 name: nvos-tech-dump-tools-for-nmx-c
-description: Analyze NVLSM and Fabric Manager logs under log/nmx/nmx-c in an NVOS / NMX-C tech-support dump (a directory or a .tar.gz) and emit a consolidated Markdown + HTML report — NVLSM topology / port-state events with time clustering, NVLSM forensics (INIT/Unlink counts), and full Fabric Manager (-vvv) parsing. Handles a single dump or, with --batch, many dumps in parallel plus a rack-level comparison report. Use this skill when the user provides an NVOS dump or tarball (or several) and asks to analyze NMX-C / NVLSM / Fabric Manager logs.
+description: Analyze NVLSM and Fabric Manager logs under log/nmx/nmx-c in an NVOS / NMX-C tech-support dump (a directory or a .tar.gz) and emit a consolidated Markdown + HTML report — NVLSM topology / port-state events with time clustering, NVLSM forensics (INIT/Unlink counts), and full Fabric Manager (-vvv) parsing. Use this skill when the user provides an NVOS dump or tarball and asks to analyze NMX-C / NVLSM / Fabric Manager logs.
 ---
 
 # Analyze NVOS NMX-C Tech Dump Logs (NVLSM + Fabric Manager)
@@ -51,7 +51,7 @@ The input is **one** NVOS / NMX-C tech dump, given as either:
 
 The tool validates that `log/nmx` exists *before* doing any heavy work. For a tarball it scans the member list first and extracts **only** the `log/nmx` subtree to a temporary directory (never the full dump), then cleans it up afterward. If `log/nmx` is missing it refuses to run.
 
-### Step 2: Run the analysis (single dump)
+### Step 2: Run the analysis
 
 ```bash
 <SKILL_ROOT>/.venv/bin/python <SKILL_ROOT>/scripts/main.py <dump_dir_or.tar.gz> -o <output_dir> [--name <basename>]
@@ -76,24 +76,6 @@ Example:
 ```
 
 `main.py` prints the number of `log/nmx/nmx-c` root(s) found and the two output paths; any non-fatal parse issues are listed as `Warnings:` on stderr while the report is still written.
-
-### Step 2b: Batch mode — multiple dumps in parallel
-
-To analyze several dumps at once (e.g. a whole rack of switch dumps), use `--batch`. Each dump runs in **its own process** (real parallelism — the parsing is CPU-bound, so it scales with cores), and a **rack-level comparison report** is written alongside the per-dump reports.
-
-```bash
-# Explicit list of dumps (directories and/or .tar.gz, mixed is fine)
-<SKILL_ROOT>/.venv/bin/python <SKILL_ROOT>/scripts/main.py --batch dump1/ dump2.tar.gz dump3/ -o <output_dir> [-j N]
-
-# Or point at ONE parent directory and let it scan for the dumps inside
-<SKILL_ROOT>/.venv/bin/python <SKILL_ROOT>/scripts/main.py --batch /path/to/rack_dumps/ -o <output_dir>
-```
-
-- **Inputs** accept both forms: an explicit list of dump dirs / tarballs, **and/or** a parent directory that is scanned for child `*.tar.gz` and `log/nmx` dump dirs. `--batch` is auto-enabled when more than one input path is given.
-- `-j, --jobs N` (optional): number of worker processes. Default: `min(#dumps, CPU count)`.
-- **Outputs**: one `<dump>.md` + `<dump>.html` per dump (named after each dump dir / tarball), plus **`rack-comparison.md` + `rack-comparison.html`** — a cross-dump report with a per-dump run-status table, a per-node overview (FM files / events, port-event groups, NVLSM state changes, key FM failure counts), and a Fabric-Manager category matrix (node × category).
-- **Error isolation**: a dump that fails validation or parsing does **not** abort the batch — it is marked `FAILED` (with the reason) in the comparison report's Run Status table while the rest complete. The exit code is non-zero only if *every* dump failed.
-- **Platform**: Linux uses the `fork` start method; macOS / others use `spawn`. Each tarball worker extracts to its own temp dir, so there are no cross-process collisions.
 
 ### Step 3: What the report covers
 
@@ -121,7 +103,7 @@ Edit these only to retune grouping; the defaults mirror `nvos_parser` FM `-vvv` 
 ├── pyproject.toml      # uv project (stdlib only — empty dependency list)
 ├── uv.lock             # pinned (interpreter only; no packages)
 └── scripts/
-    ├── main.py         # CLI entry point (single dump + --batch)
+    ├── main.py         # CLI entry point
     └── nmx_log_tools/
         ├── discovery.py        # log/nmx validation + file discovery
         ├── platform_identity.py
@@ -129,13 +111,12 @@ Edit these only to retune grouping; the defaults mirror `nvos_parser` FM `-vvv` 
         ├── sources/            # directory vs tarball input
         ├── parsers/            # nvlsm_health, nvlsm_forensics, fabric_manager
         ├── event_grouping/     # adaptive time clustering
-        ├── analyze/            # pipeline.py; run.py (single-dump core); batch.py (parallel + dir scan)
-        └── report/             # markdown + html renderers; comparison.py (rack-level report)
+        ├── analyze/            # pipeline orchestration
+        └── report/             # markdown + html renderers
 ```
 
 ## Notes
 
 - The tool extracts only the `log/nmx` subtree from a tarball into a temp directory and removes it on exit — it never unpacks the full dump.
 - The HTML report embeds its own CSS/JS (no CDN, opens offline) and is the recommended viewer for the wide aggregated tables.
-- Batch mode (`--batch`) analyzes each dump in a separate process (Linux `fork` / else `spawn`); this is the only way to get real parallelism since the parsing is CPU-bound pure-Python (the GIL would serialize threads). One failing dump is isolated and reported, not fatal to the batch.
 - Platform: Linux and macOS. Python **3.9+**, standard library only (no third-party dependencies).
