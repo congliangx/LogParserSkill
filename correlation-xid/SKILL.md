@@ -45,7 +45,7 @@ ls <SKILL_ROOT>/.venv/bin/python
 This skill consumes the *outputs* of the other two skills. If they have not been run yet, run them first:
 
 - `analyze-nv-bug-report` on the compute-tray `nv-bug-report.log(.gz)` files (batch mode is fine) → a `report/` directory of `*-nv-bug-report-analysis-report.md`.
-- `nvos-tech-dump-tools-for-nmx-c` on the NVOS dump(s) → `<dump>.md` (single or batch).
+- `nvos-tech-dump-tools-for-nmx-c` on the NVOS dump(s) → `<dump>.md`.
 
 ### Step 2: Run the correlation
 
