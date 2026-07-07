@@ -37,6 +37,7 @@ FM_EVENT_TABLE_COLUMNS: List[str] = [
     "Compute Slot Idx",
     "Module ID",
     "GPU ID",
+    "Port",
     "Detail",
 ]
 
@@ -72,6 +73,7 @@ def _fm_event_row_cells(row: FmEventRow) -> List[str]:
         row.compute_slot_index or "-",
         row.module_id or "-",
         row.gpu_id or "-",
+        row.port_num or "-",
         row.detail or "-",
     ]
 
