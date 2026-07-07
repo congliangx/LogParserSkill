@@ -274,6 +274,7 @@ def _fnm_hits(fnm_all, sw, window_s: int):
 def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchReport],
                  auto_tz: bool, cross=None) -> Doc:
     d = Doc("Xid ↔ NVOS Correlation Report")
+    slot_by_host = {t.hostname: t.slot for t in trays if t.hostname}
 
     n_ps = sum(len(n.port_state_events) for s in switches for n in s.nodes)
     n_fnm = sum(len(n.fnm_events) for s in switches for n in s.nodes)
@@ -382,19 +383,41 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
                 f"{sw.ref} {sev_tag}@ {T.fmt(T.shift(sw.start, res.offset_min))} "
                 f"(switch raw {T.fmt(sw.start)}) ↔ {xref}", red=is_xid)
             if cross is not None and xid_egs:
-                seen = set()
-                xrows = []
+                agg: dict = {}   # (xid, mnem, sev) -> {"ex": str, "hosts": [..]}
+                order: List[tuple] = []
                 for gid in xid_egs:
-                    for xid, mnem, sev_x, ex in cross.xid_details.get(gid, []):
+                    for entry in cross.xid_details.get(gid, []):
+                        xid, mnem, sev_x, ex = entry[0], entry[1], entry[2], entry[3]
+                        hosts = entry[4] if len(entry) > 4 else []
                         key = (xid, mnem, sev_x)
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        xrows.append([xid, mnem or "-", sev_x or "-", ex])
-                if xrows:
+                        if key not in agg:
+                            agg[key] = {"ex": ex, "hosts": []}
+                            order.append(key)
+                        for h in hosts:
+                            if h not in agg[key]["hosts"]:
+                                agg[key]["hosts"].append(h)
+                if order:
+                    xrows = []
+                    for key in order:
+                        xid, mnem, sev_x = key
+                        hosts = sorted(agg[key]["hosts"])
+                        slots = ", ".join(slot_by_host.get(h, "-") for h in hosts) or "-"
+                        xrows.append([xid, mnem or "-", sev_x or "-",
+                                      ", ".join(hosts) or "-", slots, agg[key]["ex"]])
                     d.p("Xid raw log (cross-node Xid Event Group "
-                        + ", ".join(str(i) for i in xid_egs) + ", deduped across nodes):")
-                    d.table(["Xid", "Mnemonic", "Severity", "Example NVRM raw log"], xrows)
+                        + ", ".join(str(i) for i in xid_egs) + ", deduped across nodes; "
+                        "Hostname / Slot list every compute tray that reported each Xid):")
+                    d.table(["Xid", "Mnemonic", "Severity", "Hostname", "Slot",
+                             "Example NVRM raw log"], xrows)
+                    sup_seen = set()
+                    for gid in xid_egs:
+                        for host, text in cross.xid_suppressed.get(gid, []):
+                            if (host, text) in sup_seen:
+                                continue
+                            sup_seen.add((host, text))
+                            slot = slot_by_host.get(host, "")
+                            d.p(f"{text} — {host}" + (f" [slot {slot}]" if slot else ""),
+                                note=True)
             fnm = _fnm_hits(fnm_all, sw, res.window_s)
             if fnm:
                 fnm = sorted(fnm, key=lambda e: e.start)
@@ -438,7 +461,7 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
             for gid, s, e in un_xid:
                 xids = "; ".join(
                     " ".join(p for p in (f"Xid {xid}", mnem, sev) if p)
-                    for xid, mnem, sev, _ex in cross.xid_details.get(gid, []))
+                    for xid, mnem, sev, _ex, _hosts in cross.xid_details.get(gid, []))
                 rows.append([f"Xid Event Group {gid}", T.fmt(s), T.fmt(e), xids or "-"])
             d.details_open(xid_sum)
             d.table(["nvbr ref", "Start", "End", "Xid types"], rows)

@@ -88,5 +88,8 @@ class CrossNodeReport:
     path: str
     xid_groups: List[Tuple[int, datetime, datetime]] = field(default_factory=list)
     imex_groups: List[Tuple[int, datetime, datetime]] = field(default_factory=list)
-    # {xid_gid: [(xid, mnemonic, severity, example_nvrm_line), ...]} — node-deduped
-    xid_details: Dict[int, List[Tuple[str, str, str, str]]] = field(default_factory=dict)
+    # {xid_gid: [(xid, mnemonic, severity, example_nvrm_line, [hostnames]), ...]}
+    # node-deduped by signature; hostnames = every compute tray that reported it.
+    xid_details: Dict[int, List[Tuple[str, str, str, str, List[str]]]] = field(default_factory=dict)
+    # {xid_gid: [(hostname, "+N more derivative Xid X (caused by Xid Y) suppressed"), ...]}
+    xid_suppressed: Dict[int, List[Tuple[str, str]]] = field(default_factory=dict)
