@@ -233,7 +233,7 @@ def _fm_slim_rows(ev, cap: int = FM_ROW_CAP):
         slots = ", ".join(str(s) for s in sorted(g["slots"], key=slot_key)) or "-"
         rows.append([duration(g["times"]), level, cat, slots, detail])
     rows.sort(key=lambda r: r[0])   # chronological by span start
-    disp = ["Time", "Level", "Category", "Compute Slot", "Detail"]
+    disp = ["Time", "Level", "Category", "Compute Tray Index", "Detail"]
     return disp, rows[:cap], len(order), ev.extra.get("fm_total", 0)
 
 
@@ -274,7 +274,7 @@ def _fnm_hits(fnm_all, sw, window_s: int):
 def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchReport],
                  auto_tz: bool, cross=None) -> Doc:
     d = Doc("Xid ↔ NVOS Correlation Report")
-    slot_by_host = {t.hostname: t.slot for t in trays if t.hostname}
+    tray_index_by_host = {t.hostname: t.tray_index for t in trays if t.hostname}
 
     n_ps = sum(len(n.port_state_events) for s in switches for n in s.nodes)
     n_fnm = sum(len(n.fnm_events) for s in switches for n in s.nodes)
@@ -401,13 +401,13 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
                     for key in order:
                         xid, mnem, sev_x = key
                         hosts = sorted(agg[key]["hosts"])
-                        slots = ", ".join(slot_by_host.get(h, "-") for h in hosts) or "-"
+                        tray_idx = ", ".join(tray_index_by_host.get(h, "-") for h in hosts) or "-"
                         xrows.append([xid, mnem or "-", sev_x or "-",
-                                      ", ".join(hosts) or "-", slots, agg[key]["ex"]])
+                                      ", ".join(hosts) or "-", tray_idx, agg[key]["ex"]])
                     d.p("Xid raw log (cross-node Xid Event Group "
                         + ", ".join(str(i) for i in xid_egs) + ", deduped across nodes; "
-                        "Hostname / Slot list every compute tray that reported each Xid):")
-                    d.table(["Xid", "Mnemonic", "Severity", "Hostname", "Slot",
+                        "Hostname / Compute Tray Index list every compute tray that reported each Xid):")
+                    d.table(["Xid", "Mnemonic", "Severity", "Hostname", "Compute Tray Index",
                              "Example NVRM raw log"], xrows)
                     sup_seen = set()
                     for gid in xid_egs:
@@ -415,8 +415,8 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
                             if (host, text) in sup_seen:
                                 continue
                             sup_seen.add((host, text))
-                            slot = slot_by_host.get(host, "")
-                            d.p(f"{text} — {host}" + (f" [slot {slot}]" if slot else ""),
+                            ti = tray_index_by_host.get(host, "")
+                            d.p(f"{text} — {host}" + (f" [tray idx {ti}]" if ti else ""),
                                 note=True)
             fnm = _fnm_hits(fnm_all, sw, res.window_s)
             if fnm:
