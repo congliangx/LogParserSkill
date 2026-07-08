@@ -7,6 +7,7 @@ JS for sortable/filterable tables and expand/collapse-all, so it opens offline.
 
 from __future__ import annotations
 
+import re
 from html import escape as _esc
 from typing import List, Optional
 
@@ -47,6 +48,7 @@ tr.hidden{display:none}
 details{border:1px solid var(--border);border-radius:6px;padding:8px 12px;margin:.5em 0;background:var(--alt)}
 details[open]{background:var(--bg)}summary{cursor:pointer;font-weight:500}
 .note{color:var(--muted);font-size:.92rem}
+.cell{max-width:520px;overflow-wrap:anywhere}
 """
 
 _JS = """<script>
@@ -163,7 +165,8 @@ class Doc:
         h = "".join(f"<th>{_esc(x)}</th>" for x in headers)
         body = []
         for r in rows:
-            body.append("<tr>" + "".join(f"<td>{_esc(str(c))}</td>" for c in r) + "</tr>")
+            body.append("<tr>" + "".join(
+                f"<td><div class='cell'>{_esc(str(c))}</div></td>" for c in r) + "</tr>")
         return f"<div class='table-wrap'><table><thead><tr>{h}</tr></thead><tbody>" + "".join(body) + "</tbody></table></div>"
 
 
@@ -174,32 +177,70 @@ def _fmt_off(mins: int) -> str:
 
 
 FM_ROW_CAP = 50
-_FM_SLIM = [("Time", "Time"), ("Level", "Level"), ("Category", "Category"),
-            ("GPU GUID", "GPU GUID"), ("Compute Slot Idx", "Cmp Slot"),
-            ("Detail", "Detail")]   # (source header name, display name)
+# Parses a cross-node "+N more derivative Xid <dxid> ... suppressed" note ->
+# (count, derivative_xid) so the affected Xid row can be flagged.
+_SUP_PARSE = re.compile(r"\+\s*(\d+)\s+more\s+derivative\s+Xid\s+(\d+)", re.I)
 
 
 def _fm_slim_rows(ev, cap: int = FM_ROW_CAP):
-    """Project a port_state Event's FM table (Event.extra) onto the slim column
-    set, re-aggregate identical slim rows with a ×count, sort by count desc.
-    Returns (display_headers, rows, unique, total) or None if no FM table."""
+    """Collapse a port_state Event's FM table (Event.extra) into distinct errors.
+
+    Rows are merged by (Level, Category, Detail): identical error lines become one
+    row that lists every affected Compute Slot and the time span over which the
+    error occurred. The GPU GUID and per-row repeat counts are dropped for
+    compactness. Returns (display_headers, rows, distinct, total) or None if there
+    is no FM table.
+    """
     hdr = ev.extra.get("fm_header") or []
     raw = ev.extra.get("fm_rows") or []
     if not raw:
         return None
-    idx = [hdr.index(src) if src in hdr else -1 for src, _ in _FM_SLIM]
-    agg: dict = {}
+
+    def col(name):
+        return hdr.index(name) if name in hdr else -1
+
+    ti, li, ci, si, di = (col("Time"), col("Level"), col("Category"),
+                          col("Compute Slot Idx"), col("Detail"))
+
+    def cell(cells, i):
+        return (cells[i] if 0 <= i < len(cells) else "") or ""
+
+    groups: dict = {}
     order: List[tuple] = []
-    for cells, cnt in raw:
-        key = tuple(cells[i] if 0 <= i < len(cells) else "-" for i in idx)
-        if key not in agg:
-            agg[key] = 0
+    for cells, _cnt in raw:
+        key = (cell(cells, li) or "-", cell(cells, ci) or "-", cell(cells, di) or "-")
+        g = groups.get(key)
+        if g is None:
+            g = {"times": set(), "slots": set()}
+            groups[key] = g
             order.append(key)
-        agg[key] += cnt
-    order.sort(key=lambda k: -agg[k])
-    disp = [d for _, d in _FM_SLIM] + ["×"]
-    rows = [list(k) + [str(agg[k])] for k in order[:cap]]
-    return disp, rows, len(order), ev.extra.get("fm_total", 0)
+        t = cell(cells, ti)
+        if t:
+            g["times"].add(t)
+        slot = cell(cells, si)
+        if slot and slot != "-":
+            g["slots"].add(slot)
+
+    def slot_key(s):
+        try:
+            return (0, int(s))
+        except ValueError:
+            return (1, s)
+
+    def duration(times):
+        if not times:
+            return "-"
+        lo, hi = min(times), max(times)
+        return lo if lo == hi else f"{lo} – {hi}"
+
+    rows = []
+    for level, cat, detail in order:
+        g = groups[(level, cat, detail)]
+        slots = ", ".join(str(s) for s in sorted(g["slots"], key=slot_key)) or "-"
+        rows.append([duration(g["times"]), level, cat, slots, detail])
+    rows.sort(key=lambda r: r[0])   # chronological by span start
+    disp = ["Time", "Level", "Category", "Compute Tray Index", "Detail"]
+    return disp, rows[:cap], len(order), ev.extra.get("fm_total", 0)
 
 
 def _xref(cross, kind: str, dt, tol: int = 120) -> Optional[int]:
@@ -239,6 +280,7 @@ def _fnm_hits(fnm_all, sw, window_s: int):
 def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchReport],
                  auto_tz: bool, cross=None) -> Doc:
     d = Doc("Xid ↔ NVOS Correlation Report")
+    tray_index_by_host = {t.hostname: t.tray_index for t in trays if t.hostname}
 
     n_ps = sum(len(n.port_state_events) for s in switches for n in s.nodes)
     n_fnm = sum(len(n.fnm_events) for s in switches for n in s.nodes)
@@ -347,19 +389,66 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
                 f"{sw.ref} {sev_tag}@ {T.fmt(T.shift(sw.start, res.offset_min))} "
                 f"(switch raw {T.fmt(sw.start)}) ↔ {xref}", red=is_xid)
             if cross is not None and xid_egs:
-                seen = set()
-                xrows = []
+                agg: dict = {}   # (xid, mnem, sev) -> {"ex": str, "hosts": [..]}
+                order: List[tuple] = []
                 for gid in xid_egs:
-                    for xid, mnem, sev_x, ex in cross.xid_details.get(gid, []):
+                    for entry in cross.xid_details.get(gid, []):
+                        xid, mnem, sev_x, ex = entry[0], entry[1], entry[2], entry[3]
+                        hosts = entry[4] if len(entry) > 4 else []
                         key = (xid, mnem, sev_x)
-                        if key in seen:
+                        if key not in agg:
+                            agg[key] = {"ex": ex, "hosts": []}
+                            order.append(key)
+                        for h in hosts:
+                            if h not in agg[key]["hosts"]:
+                                agg[key]["hosts"].append(h)
+                # Suppressed-derivative counts per Xid number (from §4 "+N more …
+                # suppressed"), so the affected Xid row can flag "(+N more
+                # suppressed)" and fold in any hosts seen only in those notes.
+                sup_by_xid: dict = {}
+                for gid in xid_egs:
+                    for host, text in cross.xid_suppressed.get(gid, []):
+                        mm = _SUP_PARSE.search(text)
+                        if not mm:
                             continue
-                        seen.add(key)
-                        xrows.append([xid, mnem or "-", sev_x or "-", ex])
-                if xrows:
+                        dxid = mm.group(2)
+                        s = sup_by_xid.setdefault(dxid, {"hosts": [], "count": 0})
+                        s["count"] += int(mm.group(1))
+                        if host and host not in s["hosts"]:
+                            s["hosts"].append(host)
+                if order:
+                    xrows = []
+                    for key in order:
+                        xid, mnem, sev_x = key
+                        hosts = list(agg[key]["hosts"])
+                        sup = sup_by_xid.get(xid)
+                        if sup:
+                            for h in sup["hosts"]:
+                                if h not in hosts:
+                                    hosts.append(h)
+                        hosts = sorted(hosts)
+                        host_cell = ", ".join(hosts) or "-"
+                        tray_cell = ", ".join(tray_index_by_host.get(h, "-") for h in hosts) or "-"
+                        if sup:
+                            tag = " (+ more suppressed)"
+                            host_cell += tag
+                            tray_cell += tag
+                        xrows.append([xid, mnem or "-", sev_x or "-",
+                                      host_cell, tray_cell, agg[key]["ex"]])
                     d.p("Xid raw log (cross-node Xid Event Group "
-                        + ", ".join(str(i) for i in xid_egs) + ", deduped across nodes):")
-                    d.table(["Xid", "Mnemonic", "Severity", "Example NVRM raw log"], xrows)
+                        + ", ".join(str(i) for i in xid_egs) + ", deduped across nodes; "
+                        "Hostname / Compute Tray Index list every compute tray that reported each Xid):")
+                    d.table(["Xid", "Mnemonic", "Severity", "Hostname", "Compute Tray Index",
+                             "Example NVRM raw log"], xrows)
+                    sup_seen = set()
+                    for gid in xid_egs:
+                        for host, text in cross.xid_suppressed.get(gid, []):
+                            if (host, text) in sup_seen:
+                                continue
+                            sup_seen.add((host, text))
+                            ti = tray_index_by_host.get(host, "")
+                            d.p(f"{text} — {host}" + (f" [tray idx {ti}]" if ti else ""),
+                                note=True)
             fnm = _fnm_hits(fnm_all, sw, res.window_s)
             if fnm:
                 fnm = sorted(fnm, key=lambda e: e.start)
@@ -377,10 +466,13 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
             if fm:
                 disp, frows, unique, total = fm
                 d.details_open(f"Fabric Manager log — {sw.ref} (same time window): "
-                               f"{unique} unique / {total} rows")
+                               f"{unique} distinct error(s) / {total} FM rows")
                 d.table(disp, frows)
                 if unique > FM_ROW_CAP:
-                    d.p(f"… +{unique - FM_ROW_CAP} more unique FM row(s) suppressed", note=True)
+                    d.p(f"… +{unique - FM_ROW_CAP} more distinct error(s) suppressed", note=True)
+                d.p("This is a de-duplicated summary (merged by error); for the full "
+                    "Fabric Manager log see the nvos-tech-dump-tools-for-nmx-c report "
+                    f"for {sw.ref}.", note=True)
                 d.details_close()
             d.details_close()
     else:
@@ -400,7 +492,7 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
             for gid, s, e in un_xid:
                 xids = "; ".join(
                     " ".join(p for p in (f"Xid {xid}", mnem, sev) if p)
-                    for xid, mnem, sev, _ex in cross.xid_details.get(gid, []))
+                    for xid, mnem, sev, _ex, _hosts in cross.xid_details.get(gid, []))
                 rows.append([f"Xid Event Group {gid}", T.fmt(s), T.fmt(e), xids or "-"])
             d.details_open(xid_sum)
             d.table(["nvbr ref", "Start", "End", "Xid types"], rows)

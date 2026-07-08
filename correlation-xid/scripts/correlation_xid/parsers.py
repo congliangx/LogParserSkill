@@ -378,29 +378,65 @@ def _xref_groups(region: str) -> List[Tuple[int, datetime, datetime]]:
     return out
 
 
-def _distinct_xids(block: str) -> List[Tuple[str, str, str, str]]:
+def _distinct_xids(block: str) -> List[Tuple[str, str, str, str, List[str]]]:
     """From one cross-node Xid event-group block's raw-log table, return distinct
-    ``(xid, mnemonic, severity, example)`` — deduped across nodes (first NVRM line
-    per signature kept, syslog prefix stripped so it is node-agnostic)."""
-    out: List[Tuple[str, str, str, str]] = []
-    seen = set()
-    for lm in _XID_LINE_RE.finditer(block):
+    ``(xid, mnemonic, severity, example, hostnames)`` — deduped across nodes by
+    signature. The cross-node §4 table has a ``Hostname`` column, so every tray
+    that reported a given signature is collected; the first NVRM line is kept as
+    the example (node prefix collapsed)."""
+    out: List[Tuple[str, str, str, str, List[str]]] = []
+    index: Dict[Tuple[str, str, str], int] = {}
+    for line in block.splitlines():
+        s = line.strip()
+        if not s.startswith("|"):
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if len(cells) < 5:
+            continue
+        host = cells[1].strip("` ")
+        raw = cells[4].strip().strip("`")
+        lm = _XID_LINE_RE.search(raw)
+        if not lm:                       # header / separator / suppressed-summary rows
+            continue
         _bdf, xid, mnem, sev = lm.groups()
         key = (xid, mnem or "", sev or "")
-        if key in seen:
+        if key not in index:
+            index[key] = len(out)
+            out.append((xid, mnem or "", sev or "", " ".join(raw.split()), []))
+        hosts = out[index[key]][4]
+        if host and host not in hosts:
+            hosts.append(host)
+    return out
+
+
+_SUPPRESS_RE = re.compile(r"\+\s*\d+\s+more\b.*?suppressed", re.I)
+
+
+def _suppressed_rows(block: str) -> List[Tuple[str, str]]:
+    """Collect the cross-node §4 '+N more … suppressed' derivative-collapse rows:
+    ``[(hostname, summary_text), ...]`` (e.g. hostname + "+5438 more derivative
+    Xid 45 entries (caused by Xid 145) suppressed")."""
+    out: List[Tuple[str, str]] = []
+    for line in block.splitlines():
+        s = line.strip()
+        if not s.startswith("|") or "suppressed" not in s:
             continue
-        seen.add(key)
-        end_bt = block.find("`", lm.start())
-        ex = block[lm.start():end_bt] if end_bt != -1 else block[lm.start():lm.end()]
-        out.append((xid, mnem or "", sev or "", " ".join(ex.split())))
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if len(cells) < 5:
+            continue
+        m = _SUPPRESS_RE.search(cells[4])
+        if m:
+            out.append((cells[1].strip("` "), m.group(0).strip()))
     return out
 
 
 def _parse_xref_xid_timeline(region: str):
-    """Return (groups, details) for §4: groups=[(gid,start,end)],
-    details={gid: [(xid, mnemonic, severity, example), ...]}."""
+    """Return (groups, details, suppressed) for §4: groups=[(gid,start,end)],
+    details={gid: [(xid, mnemonic, severity, example, hosts), ...]},
+    suppressed={gid: [(hostname, '+N more … suppressed'), ...]}."""
     groups: List[Tuple[int, datetime, datetime]] = []
-    details: Dict[int, List[Tuple[str, str, str, str]]] = {}
+    details: Dict[int, List[Tuple[str, str, str, str, List[str]]]] = {}
+    suppressed: Dict[int, List[Tuple[str, str]]] = {}
     matches = list(_XREF_GRP_RE.finditer(region))
     for i, m in enumerate(matches):
         gid_s, s_raw, e_raw = m.groups()
@@ -410,8 +446,12 @@ def _parse_xref_xid_timeline(region: str):
         gid = int(gid_s)
         groups.append((gid, s, _xref_end(e_raw, s)))
         blk_end = matches[i + 1].start() if i + 1 < len(matches) else len(region)
-        details[gid] = _distinct_xids(region[m.end():blk_end])
-    return groups, details
+        blk = region[m.end():blk_end]
+        details[gid] = _distinct_xids(blk)
+        sup = _suppressed_rows(blk)
+        if sup:
+            suppressed[gid] = sup
+    return groups, details, suppressed
 
 
 def parse_nvbug_cross(path: str, text: str) -> CrossNodeReport:
@@ -420,7 +460,7 @@ def parse_nvbug_cross(path: str, text: str) -> CrossNodeReport:
     rep = CrossNodeReport(path=path)
     rep.imex_groups = _xref_groups(
         _slice(text, r"^## 2\. IMEX Node Disconnect Timeline", (r"^## 3\.",)))
-    rep.xid_groups, rep.xid_details = _parse_xref_xid_timeline(
+    rep.xid_groups, rep.xid_details, rep.xid_suppressed = _parse_xref_xid_timeline(
         _slice(text, r"^## 4\. Xid Unified Timeline", (r"^## 5\.",)))
     return rep
 
