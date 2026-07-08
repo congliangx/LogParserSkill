@@ -430,7 +430,7 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
                         host_cell = ", ".join(hosts) or "-"
                         tray_cell = ", ".join(tray_index_by_host.get(h, "-") for h in hosts) or "-"
                         if sup:
-                            tag = f" (+{sup['count']} more suppressed)"
+                            tag = " (+ more suppressed)"
                             host_cell += tag
                             tray_cell += tag
                         xrows.append([xid, mnem or "-", sev_x or "-",
