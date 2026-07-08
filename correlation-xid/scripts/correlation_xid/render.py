@@ -7,6 +7,7 @@ JS for sortable/filterable tables and expand/collapse-all, so it opens offline.
 
 from __future__ import annotations
 
+import re
 from html import escape as _esc
 from typing import List, Optional
 
@@ -47,6 +48,7 @@ tr.hidden{display:none}
 details{border:1px solid var(--border);border-radius:6px;padding:8px 12px;margin:.5em 0;background:var(--alt)}
 details[open]{background:var(--bg)}summary{cursor:pointer;font-weight:500}
 .note{color:var(--muted);font-size:.92rem}
+.cell{max-width:520px;overflow-wrap:anywhere}
 """
 
 _JS = """<script>
@@ -163,7 +165,8 @@ class Doc:
         h = "".join(f"<th>{_esc(x)}</th>" for x in headers)
         body = []
         for r in rows:
-            body.append("<tr>" + "".join(f"<td>{_esc(str(c))}</td>" for c in r) + "</tr>")
+            body.append("<tr>" + "".join(
+                f"<td><div class='cell'>{_esc(str(c))}</div></td>" for c in r) + "</tr>")
         return f"<div class='table-wrap'><table><thead><tr>{h}</tr></thead><tbody>" + "".join(body) + "</tbody></table></div>"
 
 
@@ -174,6 +177,9 @@ def _fmt_off(mins: int) -> str:
 
 
 FM_ROW_CAP = 50
+# Parses a cross-node "+N more derivative Xid <dxid> ... suppressed" note ->
+# (count, derivative_xid) so the affected Xid row can be flagged.
+_SUP_PARSE = re.compile(r"\+\s*(\d+)\s+more\s+derivative\s+Xid\s+(\d+)", re.I)
 
 
 def _fm_slim_rows(ev, cap: int = FM_ROW_CAP):
@@ -396,14 +402,39 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
                         for h in hosts:
                             if h not in agg[key]["hosts"]:
                                 agg[key]["hosts"].append(h)
+                # Suppressed-derivative counts per Xid number (from §4 "+N more …
+                # suppressed"), so the affected Xid row can flag "(+N more
+                # suppressed)" and fold in any hosts seen only in those notes.
+                sup_by_xid: dict = {}
+                for gid in xid_egs:
+                    for host, text in cross.xid_suppressed.get(gid, []):
+                        mm = _SUP_PARSE.search(text)
+                        if not mm:
+                            continue
+                        dxid = mm.group(2)
+                        s = sup_by_xid.setdefault(dxid, {"hosts": [], "count": 0})
+                        s["count"] += int(mm.group(1))
+                        if host and host not in s["hosts"]:
+                            s["hosts"].append(host)
                 if order:
                     xrows = []
                     for key in order:
                         xid, mnem, sev_x = key
-                        hosts = sorted(agg[key]["hosts"])
-                        tray_idx = ", ".join(tray_index_by_host.get(h, "-") for h in hosts) or "-"
+                        hosts = list(agg[key]["hosts"])
+                        sup = sup_by_xid.get(xid)
+                        if sup:
+                            for h in sup["hosts"]:
+                                if h not in hosts:
+                                    hosts.append(h)
+                        hosts = sorted(hosts)
+                        host_cell = ", ".join(hosts) or "-"
+                        tray_cell = ", ".join(tray_index_by_host.get(h, "-") for h in hosts) or "-"
+                        if sup:
+                            tag = f" (+{sup['count']} more suppressed)"
+                            host_cell += tag
+                            tray_cell += tag
                         xrows.append([xid, mnem or "-", sev_x or "-",
-                                      ", ".join(hosts) or "-", tray_idx, agg[key]["ex"]])
+                                      host_cell, tray_cell, agg[key]["ex"]])
                     d.p("Xid raw log (cross-node Xid Event Group "
                         + ", ".join(str(i) for i in xid_egs) + ", deduped across nodes; "
                         "Hostname / Compute Tray Index list every compute tray that reported each Xid):")
