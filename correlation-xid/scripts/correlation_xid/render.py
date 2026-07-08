@@ -507,6 +507,9 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
             d.details_open(imex_sum)
             d.table(["nvbr ref", "Start", "End"], rows)
             d.details_close()
+            d.p("Note: IMEX event groups with no switch-side fabric correlation are commonly "
+                "caused by an IMEX service restart or a transient inter-node network fluctuation, "
+                "rather than a switch fabric fault.", note=True)
         else:
             d.p(imex_sum + ".")
     else:
@@ -521,5 +524,9 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
             d.details_open(f"{len(res.unmatched_compute)} uncorrelated compute event(s)")
             d.table(["Start", "End", "Kind", "Tray", "Chassis", "Event", "Ref"], rows)
             d.details_close()
+        if unmatched_imex:
+            d.p("Note: IMEX event groups with no switch-side fabric correlation are commonly "
+                "caused by an IMEX service restart or a transient inter-node network fluctuation, "
+                "rather than a switch fabric fault.", note=True)
 
     return d
