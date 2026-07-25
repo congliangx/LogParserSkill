@@ -66,28 +66,33 @@ Options:
 - `-o, --output-dir` (required): directory for the report.
 - `--name` (default `correlation-xid-report`): output base filename.
 - `--tz-offset-minutes N` (default `0`): minutes **added to the switch (NVOS) timestamps** to align them with the compute-tray clock. Positive = the switch clock is behind the tray clock.
-- `--auto-tz`: auto-pick the offset that maximizes time-aligned event pairs (see Timezone note). Recommended for the first pass.
+- `--auto-tz`: auto-pick the offset that maximizes time-aligned event pairs (see Timezone note). The default when the user has no known offset.
+- `--interactive-tz`: sweep like `--auto-tz`, print the top candidate offsets, then **confirm on stdin** — Enter accepts the proposal, or type an offset (integer minutes, e.g. `60` / `-480`, or `±HH:MM`, e.g. `+01:00`). EOF / empty stdin accepts the proposal, so unattended runs never hang. Meant for humans at a real terminal.
 - `--window-seconds S` (default `120`): how close two anchor moments must be to count as "same time window".
 - `--cross-chassis`: correlate across different chassis serials (default: same chassis only).
 
-Outputs `<name>.md` and a self-contained `<name>.html` (sortable/filterable tables, expand/collapse) in the output directory.
+Outputs `<name>.md` and a self-contained `<name>.html` (sortable/filterable tables, expand/collapse, per-event cards with anchor navigation) in the output directory. The report header records **how** the offset was chosen (auto / manual / interactively confirmed / interactively entered).
 
-### Step 3: Timezone alignment (important)
+### Step 3: Timezone alignment (important — confirm with the user)
 
-Neither report family records a timezone — both are **local wall-clock at their own host**, and the switch and compute trays may sit in different zones. So the correlation cannot assume the two clocks match.
+Neither report family records a timezone — both are **local wall-clock at their own host**, and the switch and compute trays may sit in different zones. So the correlation cannot assume the two clocks match, and the offset choice should be **confirmed by the user** whenever possible:
 
-- Start with `--auto-tz`. The report's **§1 Timezone Alignment** table sweeps candidate offsets (±13h, 30-min steps) and scores each by how many compute↔switch anchors line up; the auto pass applies the top one and prints it.
-- Sanity-check the chosen offset against the *known* deployment (e.g. switches in UTC, compute hosts in UTC+8). If the auto pick is wrong or ambiguous, re-run with an explicit `--tz-offset-minutes` (e.g. `--tz-offset-minutes 60` if the switch is 1 h behind).
-- A strong, unambiguous peak in the sweep (one offset with far more hits than the rest, with many Δ≈0 matches) is a good sign the offset is real.
+- **Agent-driven runs (Claude/Cursor/Codex):** before running, ask the user whether the deployment's actual timezone difference is known (e.g. "switches log in UTC, trays in UTC+8 → switch is 480 min behind").
+  - User provides an offset → run with `--tz-offset-minutes N` (manual).
+  - User doesn't know / doesn't answer → run with `--auto-tz` (the default AI behavior: the offset that best aggregates compute↔switch event alignment is applied automatically). Afterwards, show the user the **§1 Timezone Alignment** table and mention the applied offset so they can veto it.
+- **Human at a terminal:** use `--interactive-tz` — it prints the sweep's top candidates and lets you accept the proposal with Enter or type your own offset inline.
+- The report's **§1 Timezone Alignment** table sweeps candidate offsets (±13h, 30-min steps) and scores each by how many compute↔switch anchors line up; the applied row is marked `◀ applied`.
+- Sanity-check the chosen offset against the *known* deployment. A strong, unambiguous peak in the sweep (one offset with far more hits than the rest) is a good sign the offset is real; a flat or ambiguous sweep is a reason to ask the user again with an explicit `--tz-offset-minutes`.
 
 ### Step 4: Read the report
 
+Right under the header bullets sits a collapsed **"How to read this report (field guide)"** glossary defining every term the report uses (nvos event group, nvbr Event Group, [nvl_fatal]/[nvl_non_fatal]/[none], FNM port loss, anchor matching, switch raw vs tray clock, Compute Tray Index, derivative-Xid suppression, …). Key tables also carry a **column guide** (visible caption in both formats; hover tooltips on the HTML headers).
+
 Sections:
 
-1. **Timezone Alignment** — the offset sweep + which offset was applied.
-2. **Correlated Events** — every compute-tray Xid/IMEX event that has ≥1 time-overlapping switch event, with a per-event details block listing the matching switch port-state / FNM events (raw time, shifted time, Δ seconds, chassis, transitions).
-3. **Uncorrelated Compute-Tray Events** — Xid/IMEX groups with **no** switch correlation (an Xid with no matching fabric event is itself a signal).
-4. **Switch Event Coverage** — how many switch events matched; the long tail of unmatched switch port flaps is summarized, not listed.
+1. **Timezone Alignment** — the offset sweep, which offset was applied, and how it was chosen (auto / manual / interactive).
+2. **Correlated Events** — one fold per switch port-state fabric event that has ≥1 time-overlapping compute-tray Xid/IMEX event. In HTML each fold is an **event card**: severity rail + chips (NVL FATAL / NVL NON-FATAL / PORT EVENT, XID vs IMEX), a **switch → tray offset bridge** showing the same moment on both clocks, and the matched nvbr event-group refs; an **event-index chip strip** above the cards jumps to each one. Inside: the deduped Xid raw-log table, FNM port-loss context, and the collapsed Fabric Manager log.
+3. **Uncorrelated Compute-Tray Events** — Xid/IMEX groups with **no** switch correlation (an Xid with no matching fabric event is itself a signal); at cross-node event-group granularity when a cross-node report is among the inputs.
 
 ## Layout
 
