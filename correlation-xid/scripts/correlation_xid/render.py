@@ -7,7 +7,8 @@ guide — and §2 renders each correlated fabric event as a structured "event ca
 in HTML (severity rail, kind chips, and a switch→tray **offset bridge** showing
 both clocks joined by the applied offset) while staying a single summary line in
 Markdown. The HTML shell embeds its own CSS + a small JS for sortable/filterable
-tables, expand/collapse-all and anchor navigation, so it opens offline.
+tables, expand/collapse-all, anchor navigation and a left sidebar TOC (sections +
+§2 event cards, scroll-spy highlighted), so it opens offline.
 """
 
 from __future__ import annotations
@@ -64,7 +65,28 @@ color:var(--ink);padding:5px 11px;border-radius:6px;font-size:13px;font-family:v
 .topbar input:focus{border-color:var(--signal);outline:none}
 .topbar button{cursor:pointer}
 .topbar button:hover{border-color:var(--signal);color:var(--signal)}
-.content{max-width:1220px;margin:0 auto;padding:8px 24px 80px}
+.shell{max-width:1220px;margin:0 auto}
+.shell.with-nav{display:grid;grid-template-columns:238px minmax(0,1fr);max-width:1480px}
+.sidenav{position:sticky;top:var(--barh,50px);align-self:start;
+max-height:calc(100vh - var(--barh,50px));overflow-y:auto;
+padding:20px 12px 48px 20px;border-right:1px solid var(--line);
+display:flex;flex-direction:column;gap:2px}
+.sidenav a{display:flex;align-items:center;gap:8px;text-decoration:none;color:var(--muted);
+padding:6px 10px;border-radius:6px;font-size:12.5px;border-left:2px solid transparent}
+.sidenav a:hover{color:var(--ink);background:var(--line-soft)}
+.sidenav a.active{color:var(--ink);background:var(--line-soft);border-left-color:var(--signal)}
+.sn-h{font-weight:600;margin-top:12px}
+.sidenav a.sn-h:first-of-type{margin-top:0}
+.sn-no{font:600 10px/1 var(--mono);color:var(--muted);border:1px solid var(--line);
+border-radius:3px;padding:3px 4px;letter-spacing:.08em;flex:0 0 auto}
+.sn-item{margin-left:14px;font-family:var(--mono)}
+.sn-item .dot{width:6px;height:6px;border-radius:50%;background:var(--neutral);flex:0 0 auto}
+.sn-item.sev-fatal .dot{background:var(--fatal)}
+.sn-item.sev-warn .dot{background:var(--warn)}
+.sn-item .sn-dt{margin-left:auto;color:var(--muted);font-size:11px;white-space:nowrap}
+@media(max-width:1080px){.sidenav{display:none}.shell.with-nav{display:block}}
+.content{min-width:0;padding:8px 24px 80px}
+h2{scroll-margin-top:64px}
 .params{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 6px}
 .param{display:inline-flex;align-items:baseline;gap:7px;border:1px solid var(--line);
 background:var(--panel);border-radius:6px;padding:4px 10px;
@@ -159,6 +181,7 @@ text-decoration:none;color:var(--ink);font:500 12px var(--mono)}
 .evchip.sev-warn .dot{background:var(--warn)}
 .evchip .edt{color:var(--muted)}
 @media print{.topbar{position:static}.topbar .actions{display:none}
+.sidenav{display:none}.shell.with-nav{display:block}
 body{background:#fff}details{break-inside:avoid}}
 """
 
@@ -186,9 +209,24 @@ function openTarget(){var h=location.hash;if(!h)return;var el=null;
 try{el=document.querySelector(h);}catch(e){return;}
 if(el&&el.tagName==='DETAILS')el.open=true;}
 window.addEventListener('hashchange',openTarget);openTarget();
-document.querySelectorAll('a.evchip').forEach(function(a){a.addEventListener('click',function(){
+document.querySelectorAll('a.evchip, .sidenav a').forEach(function(a){a.addEventListener('click',function(){
 var el=null;try{el=document.querySelector(a.getAttribute('href'));}catch(e){}
 if(el&&el.tagName==='DETAILS')el.open=true;});});
+var bar=document.querySelector('.topbar');
+function setBar(){if(bar)document.documentElement.style.setProperty('--barh',bar.offsetHeight+'px');}
+window.addEventListener('resize',setBar);setBar();
+var navLinks=[].slice.call(document.querySelectorAll('.sidenav a'));
+var navTargets=navLinks.map(function(a){
+try{return document.querySelector(a.getAttribute('href'));}catch(e){return null;}});
+function spy(){var y=window.scrollY+(bar?bar.offsetHeight:50)+30;var idx=-1;
+navTargets.forEach(function(el,i){
+if(el&&el.getBoundingClientRect().top+window.scrollY<=y)idx=i;});
+navLinks.forEach(function(a,i){a.classList.toggle('active',i===idx);
+if(i===idx)a.setAttribute('aria-current','true');else a.removeAttribute('aria-current');});}
+var tick=false;
+window.addEventListener('scroll',function(){if(!tick){tick=true;
+requestAnimationFrame(function(){spy();tick=false;});}},{passive:true});
+spy();
 })();
 </script>"""
 
@@ -347,6 +385,8 @@ class Doc:
         chips = "".join(f"<span class='param'><b>{_esc(k)}</b>{_esc(v)}</span>"
                         for k, v in self.meta_chips)
         masthead = f"<div class='params'>{chips}</div>" if chips else ""
+        nav = self._sidenav()
+        shell_cls = "shell with-nav" if nav else "shell"
         head = (
             "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>"
             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -355,10 +395,38 @@ class Doc:
             "<div class='actions'><input id='filter' type='search' placeholder='Filter rows…' "
             "aria-label='Filter rows'>"
             "<button id='exp'>Expand all</button><button id='col'>Collapse all</button></div></div>"
-            "<div class='content'>" + masthead
+            f"<div class='{shell_cls}'>" + nav + "<div class='content'>" + masthead
         )
-        tail = "</div>" + _JS + "</body></html>"
+        tail = "</div></div>" + _JS + "</body></html>"
         return head + "\n".join(parts) + tail
+
+    def _sidenav(self) -> str:
+        """Left navigation built from the numbered h2 sections and §2 event cards.
+        Empty string when there is nothing to link (sidebar omitted)."""
+        items: List[str] = []
+        for b in self.blocks:
+            if b[0] == "h" and b[1] == 2:
+                m = self._SECNO.match(b[2])
+                if m:
+                    items.append(
+                        f"<a class='sn-h' href='#sec-{m.group(1)}'>"
+                        f"<span class='sn-no'>{int(m.group(1)):02d}</span>"
+                        f"<span>{_esc(m.group(2))}</span></a>")
+            elif b[0] == "fo":
+                info = b[2]
+                anchor = info.get("anchor", "")
+                if not anchor:
+                    continue
+                mm = _REF_NUM.search(info.get("ref", "") or "")
+                label = f"G{mm.group(1)}" if mm else (info.get("ref") or "event")
+                dt = (info.get("t_tray") or "")[5:16]
+                items.append(
+                    f"<a class='sn-item sev-{_esc(info.get('sev_class', 'neutral'))}' "
+                    f"href='#{_esc(anchor)}'><span class='dot'></span>"
+                    f"<span>{_esc(label)}</span><span class='sn-dt'>{_esc(dt)}</span></a>")
+        if not items:
+            return ""
+        return "<nav class='sidenav' aria-label='Contents'>" + "".join(items) + "</nav>"
 
     @staticmethod
     def _html_fold(info: Dict) -> str:

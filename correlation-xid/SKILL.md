@@ -71,7 +71,7 @@ Options:
 - `--window-seconds S` (default `120`): how close two anchor moments must be to count as "same time window".
 - `--cross-chassis`: correlate across different chassis serials (default: same chassis only).
 
-Outputs `<name>.md` and a self-contained `<name>.html` (sortable/filterable tables, expand/collapse, per-event cards with anchor navigation) in the output directory. The report header records **how** the offset was chosen (auto / manual / interactively confirmed / interactively entered).
+Outputs `<name>.md` and a self-contained `<name>.html` (sortable/filterable tables, expand/collapse, per-event cards with anchor navigation, and a left sidebar TOC listing the sections plus every §2 event card with scroll-spy highlight) in the output directory. The report header records **how** the offset was chosen (auto / manual / interactively confirmed / interactively entered).
 
 ### Step 3: Timezone alignment (important — confirm with the user)
 
