@@ -118,7 +118,17 @@ _HTML_SCRIPT = """<script>
     });
   }
 
-  // ---------- 4. TOC active link ----------
+  // ---------- 3c. measure the sticky bar so offsets never drift ----------
+  var topbar = document.querySelector('.topbar');
+  function measureBar() {
+    if (topbar) {
+      document.documentElement.style.setProperty('--barh', topbar.offsetHeight + 'px');
+    }
+  }
+  window.addEventListener('resize', measureBar);
+  measureBar();
+
+  // ---------- 4. TOC active link (scroll-spy) ----------
   var tocLinks = document.querySelectorAll('.sidebar a[href^="#"]');
   if (tocLinks.length) {
     var headings = [];
@@ -128,16 +138,30 @@ _HTML_SCRIPT = """<script>
       if (el) headings.push({id: id, el: el, link: a});
     });
     function onScroll() {
-      var top = window.scrollY + 80;
+      var barh = topbar ? topbar.offsetHeight : 48;
+      var top = window.scrollY + barh + 24;
       var current = null;
       for (var i = 0; i < headings.length; i++) {
-        if (headings[i].el.offsetTop <= top) current = headings[i];
+        var y = headings[i].el.getBoundingClientRect().top + window.scrollY;
+        if (y <= top) current = headings[i];
         else break;
       }
-      tocLinks.forEach(function (a) { a.classList.remove('active'); });
-      if (current) current.link.classList.add('active');
+      tocLinks.forEach(function (a) {
+        a.classList.remove('active');
+        a.removeAttribute('aria-current');
+      });
+      if (current) {
+        current.link.classList.add('active');
+        current.link.setAttribute('aria-current', 'true');
+      }
     }
-    window.addEventListener('scroll', onScroll, {passive: true});
+    var ticking = false;
+    window.addEventListener('scroll', function () {
+      if (!ticking) {
+        ticking = true;
+        requestAnimationFrame(function () { onScroll(); ticking = false; });
+      }
+    }, {passive: true});
     onScroll();
   }
 })();
@@ -152,7 +176,11 @@ class Renderer:
 
     # ---- Block primitives ---------------------------------------------------
 
-    def heading(self, level: int, text: str) -> None:
+    def heading(self, level: int, text: str, *, nav_label: Optional[str] = None) -> None:
+        """Emit a heading. ``nav_label`` (HTML only) overrides the text shown for
+        this heading in the sidebar TOC, so a long body title can carry a short
+        sidebar label; the in-body heading always shows ``text``. Backends
+        without a TOC ignore it."""
         raise NotImplementedError
 
     def paragraph(self, html_inner: str, *, note: bool = False) -> None:
@@ -161,8 +189,11 @@ class Renderer:
         argument as pre-formatted (do not re-escape)."""
         raise NotImplementedError
 
-    def bullets(self, items: List[str]) -> None:
-        """Emit a bulleted list. ``items`` may contain inline formatting."""
+    def bullets(self, items: List[str], *, css_class: Optional[str] = None) -> None:
+        """Emit a bulleted list. ``items`` may contain inline formatting.
+        ``css_class`` is an optional class applied to the ``<ul>`` for per-list
+        styling; backends without styling ignore it (same convention as
+        ``table``'s ``css_class``)."""
         raise NotImplementedError
 
     def table(
@@ -192,9 +223,12 @@ class Renderer:
         *,
         red: bool = False,
         default_open: bool = False,
+        severity: Optional[str] = None,
     ) -> None:
         """Open a ``<details>`` block. ``summary_inner`` may already contain
-        inline formatting."""
+        inline formatting. ``severity`` (``'fatal'`` | ``'warn'`` | ``None``)
+        drives a coloured severity rail in HTML; ``red=True`` implies
+        ``'fatal'``. Backends without styling ignore ``severity``."""
         raise NotImplementedError
 
     def close_details(self) -> None:
@@ -234,16 +268,20 @@ class HtmlRenderer(Renderer):
     TOC can link to them.
     """
 
-    # Heading levels surfaced in the sidebar TOC.
-    _TOC_MIN_LEVEL = 1
+    # Heading levels surfaced in the sidebar TOC. The document h1 is the report
+    # title (already shown in the top bar), so the TOC starts at the node (h2):
+    # nodes are the primary navigation landmark, not a redundant root entry.
+    _TOC_MIN_LEVEL = 2
     _TOC_MAX_LEVEL = 4
 
     def __init__(self, *, css: str, title: str = "NMX-C Log Analysis") -> None:
         super().__init__()
         self._css = css
         self._title = title
-        # (level, slug, text) recorded in document order for the sidebar TOC.
-        self._toc: List[Tuple[int, str, str]] = []
+        # (level, slug, label, full) recorded in document order for the sidebar
+        # TOC: ``label`` is what's shown, ``full`` is the hover title (the whole
+        # heading, so a shortened node label still reveals its full identity).
+        self._toc: List[Tuple[int, str, str, str]] = []
         self._used_slugs: dict = {}
 
     def _slugify(self, text: str) -> str:
@@ -254,10 +292,13 @@ class HtmlRenderer(Renderer):
         self._used_slugs[slug] = n + 1
         return slug if n == 0 else f"{slug}-{n}"
 
-    def heading(self, level: int, text: str) -> None:
+    def heading(self, level: int, text: str, *, nav_label: Optional[str] = None) -> None:
         slug = self._slugify(text)
         if self._TOC_MIN_LEVEL <= level <= self._TOC_MAX_LEVEL:
-            self._toc.append((level, slug, text))
+            # Store the sidebar label (may be shorter than the body heading) plus
+            # the full heading for the hover title; the slug still comes from the
+            # real heading so the anchor matches.
+            self._toc.append((level, slug, nav_label or text, text))
         self.parts.append(
             f"<h{level} id=\"{slug}\">{_html_escape(text)}</h{level}>"
         )
@@ -266,10 +307,11 @@ class HtmlRenderer(Renderer):
         cls = " class='note'" if note else ""
         self.parts.append(f"<p{cls}>{html_inner}</p>")
 
-    def bullets(self, items: List[str]) -> None:
+    def bullets(self, items: List[str], *, css_class: Optional[str] = None) -> None:
         if not items:
             return
-        self.parts.append("<ul>")
+        cls = f" class=\"{_html_escape(css_class)}\"" if css_class else ""
+        self.parts.append(f"<ul{cls}>")
         for it in items:
             self.parts.append(f"<li>{it}</li>")
         self.parts.append("</ul>")
@@ -316,12 +358,16 @@ class HtmlRenderer(Renderer):
         *,
         red: bool = False,
         default_open: bool = False,
+        severity: Optional[str] = None,
     ) -> None:
+        # red implies the fatal rail; an explicit severity wins otherwise.
+        sev = "fatal" if red else severity
+        cls = f" class=\"sev-{sev}\"" if sev in ("fatal", "warn") else ""
         open_attr = " open" if default_open else ""
-        self.parts.append(f"<details{open_attr}>")
+        self.parts.append(f"<details{cls}{open_attr}>")
         if red:
             self.parts.append(
-                f"<summary><span style=\"color:red\"><strong>"
+                f"<summary><span class=\"crit\"><strong>"
                 f"{summary_inner}</strong></span></summary>"
             )
         else:
@@ -341,7 +387,7 @@ class HtmlRenderer(Renderer):
 
     def i_red(self, s: str, *, bold: bool = False) -> str:
         inner = self.i_bold(s) if bold else _html_escape(s)
-        return f"<span style=\"color:red\">{inner}</span>"
+        return f"<span class=\"crit\">{inner}</span>"
 
     def _render_toc(self) -> str:
         """Build a nested <ul> TOC from the recorded (level, slug, text)."""
@@ -349,10 +395,10 @@ class HtmlRenderer(Renderer):
             return ""
         # Normalize so the first entry sits at depth 1 regardless of its
         # heading level, then nest by relative level changes.
-        base = min(level for level, _, _ in self._toc)
+        base = min(level for level, _, _, _ in self._toc)
         out: List[str] = ["<div class=\"toc\">"]
         prev = 0  # current open depth (number of nested <ul>/<li> pairs)
-        for level, slug, text in self._toc:
+        for level, slug, label, full in self._toc:
             depth = level - base + 1
             if depth > prev:
                 # Descend: open a fresh <ul> for each level jumped.
@@ -364,7 +410,15 @@ class HtmlRenderer(Renderer):
                 out.append("</ul></li>" * (prev - depth))
             else:
                 out.append("</li>")
-            out.append(f"<li><a href=\"#{slug}\">{_html_escape(text)}</a>")
+            esc = _html_escape(label)
+            # Semantic level class (toc-l2 node / toc-l3 section / toc-l4 sub)
+            # so CSS styles each tier distinctly instead of guessing by depth.
+            # title = full heading so a shortened node label still reveals its
+            # chassis / slot / IPs on hover.
+            out.append(
+                f"<li><a class=\"toc-l{level}\" href=\"#{slug}\" "
+                f"title=\"{_html_escape(full)}\">{esc}</a>"
+            )
             prev = depth
         # Close the final item and unwind every still-open list.
         out.append("</li>")
@@ -397,6 +451,7 @@ class HtmlRenderer(Renderer):
             "</header>",
             "<div class=\"layout\">",
             "  <nav class=\"sidebar\" aria-label=\"Table of contents\">",
+            "    <div class=\"sidebar-head\">Contents</div>",
             self._render_toc(),
             "  </nav>",
             "  <main class=\"content\">",
@@ -423,7 +478,8 @@ class MdRenderer(Renderer):
     def _md_pipe_escape(s: str) -> str:
         return s.replace("|", "\\|")
 
-    def heading(self, level: int, text: str) -> None:
+    def heading(self, level: int, text: str, *, nav_label: Optional[str] = None) -> None:
+        # nav_label is a sidebar-TOC concern (HTML only); Markdown has no TOC.
         self.parts.append(f"{'#' * level} {text}")
         self.parts.append("")
 
@@ -434,7 +490,9 @@ class MdRenderer(Renderer):
         self.parts.append(body)
         self.parts.append("")
 
-    def bullets(self, items: List[str]) -> None:
+    def bullets(self, items: List[str], *, css_class: Optional[str] = None) -> None:
+        # css_class is accepted for API parity with HtmlRenderer and ignored
+        # (Markdown has no per-list styling).
         for it in items:
             self.parts.append(f"- {it}")
         if items:
@@ -480,7 +538,10 @@ class MdRenderer(Renderer):
         *,
         red: bool = False,
         default_open: bool = False,
+        severity: Optional[str] = None,
     ) -> None:
+        # severity is accepted for API parity with HtmlRenderer and ignored
+        # (Markdown keeps its inline-style red for GitHub rendering).
         open_attr = " open" if default_open else ""
         self.parts.append(f"<details{open_attr}>")
         if red:
