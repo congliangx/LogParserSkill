@@ -13,13 +13,25 @@ tables, expand/collapse-all, anchor navigation and a left sidebar TOC (sections 
 
 from __future__ import annotations
 
+import bisect
 import re
+from datetime import timedelta
 from html import escape as _esc
 from typing import Dict, List, Optional, Tuple
 
 from . import timeutil as T
 from .engine import Result
-from .models import SwitchReport, TrayReport
+from .engine import anchors as E_anchors
+from .models import (
+    FNM_KINDS,
+    RAW_KINDS,
+    SWITCH_KIND_LABEL,
+    SWITCH_KIND_ORDER,
+    SWITCH_KIND_TAG,
+    SwitchReport,
+    TrayReport,
+    worst_severity,
+)
 
 _CSS = """
 :root{
@@ -180,6 +192,9 @@ text-decoration:none;color:var(--ink);font:500 12px var(--mono)}
 .evchip.sev-fatal .dot{background:var(--fatal)}
 .evchip.sev-warn .dot{background:var(--warn)}
 .evchip .edt{color:var(--muted)}
+pre.rawlog{overflow:auto;max-height:340px;margin:.6em 0;padding:10px 12px;
+border:1px solid var(--line);border-radius:8px;background:var(--code);
+font-family:var(--mono);font-size:12px;line-height:1.5;white-space:pre}
 @media print{.topbar{position:static}.topbar .actions{display:none}
 .sidenav{display:none}.shell.with-nav{display:block}
 body{background:#fff}details{break-inside:avoid}}
@@ -254,6 +269,10 @@ class Doc:
     def bullets(self, items: List[str]) -> None:
         self.blocks.append(("ul", items))
 
+    def pre(self, lines: List[str]) -> None:
+        """Verbatim log lines (fenced block in Markdown, ``<pre>`` in HTML)."""
+        self.blocks.append(("pre", list(lines)))
+
     def legend(self, summary: str, items: List[Tuple[str, str]]) -> None:
         """Collapsed term→meaning glossary (definition list in HTML)."""
         self.blocks.append(("legend", summary, items))
@@ -295,6 +314,8 @@ class Doc:
                 out.append(f"_{b[1]}_" if b[2] else b[1]); out.append("")
             elif b[0] == "ul":
                 out.extend(f"- {it}" for it in b[1]); out.append("")
+            elif b[0] == "pre":
+                out.append("```text"); out.extend(b[1]); out.append("```"); out.append("")
             elif b[0] == "legend":
                 out.append("<details>")
                 out.append(f"<summary>{b[1]}</summary>")
@@ -356,6 +377,9 @@ class Doc:
                 parts.append(f"<p{cls}>{_esc(b[1])}</p>")
             elif b[0] == "ul":
                 parts.append("<ul>" + "".join(f"<li>{_esc(it)}</li>" for it in b[1]) + "</ul>")
+            elif b[0] == "pre":
+                parts.append("<pre class='rawlog'>"
+                             + "\n".join(_esc(ln) for ln in b[1]) + "</pre>")
             elif b[0] == "legend":
                 dl = "".join(f"<dt>{_esc(t)}</dt><dd>{_esc(m)}</dd>" for t, m in b[2])
                 parts.append(f"<details class='legend'><summary>{_esc(b[1])}</summary>"
@@ -417,8 +441,7 @@ class Doc:
                 anchor = info.get("anchor", "")
                 if not anchor:
                     continue
-                mm = _REF_NUM.search(info.get("ref", "") or "")
-                label = f"G{mm.group(1)}" if mm else (info.get("ref") or "event")
+                label = info.get("nav") or (info.get("ref") or "event")
                 dt = (info.get("t_tray") or "")[5:16]
                 items.append(
                     f"<a class='sn-item sev-{_esc(info.get('sev_class', 'neutral'))}' "
@@ -583,44 +606,95 @@ def _xref(cross, kind: str, dt, tol: int = 120) -> Optional[int]:
     return best if (bestd is not None and bestd <= tol) else None
 
 
-def _fnm_hits(fnm_all, sw, window_s: int):
-    """FNM port-loss events on the same switch whose loss time is within window_s
-    of the fabric group's [start, end] (both are switch-side / same clock)."""
-    out = []
-    for e in fnm_all:
-        if e.source_id != sw.source_id:
-            continue
-        if e.start < sw.start:
-            gap = (sw.start - e.start).total_seconds()
-        elif e.start > sw.end:
-            gap = (e.start - sw.end).total_seconds()
+# Severity → card / chip styling class + label.
+_SEV_CLASS = {
+    "nvl_fatal": "fatal", "nvl_non_fatal": "warn",
+    "switch_info_failed": "warn", "partition_error": "warn",
+    "multicast_limit": "warn", "nvlsm_check": "warn",
+    "port_loss": "warn", "connection_lost": "neutral",
+    "lifecycle": "neutral", "none": "neutral",
+}
+_SEV_LABEL = {
+    "nvl_fatal": "NVL FATAL", "nvl_non_fatal": "NVL NON-FATAL",
+    "switch_info_failed": "SWITCH INFO", "partition_error": "PARTITION",
+    "multicast_limit": "MULTICAST", "nvlsm_check": "NVLSM CHECK",
+    "port_loss": "FNM PORT LOSS", "connection_lost": "CONNECTION LOST",
+    "lifecycle": "FM LIFECYCLE", "none": "PORT EVENT",
+}
+
+RAW_LINE_CAP = 40
+
+
+def _moments(hits, window_s: int) -> List[Dict]:
+    """Cluster correlation hits into switch-side *moments*.
+
+    Clustering is on the **matched switch anchor**, never on an event's
+    [start, end] span: a port-state group can span weeks between its down and its
+    recovery, so spans would chain every event in the dump into one blob. Each
+    moment therefore holds the hits whose switch anchors sit within ``window_s``
+    of each other — i.e. one instant of fabric activity, whatever mix of nvos
+    sections reported it.
+    """
+    out: List[Dict] = []
+    for h in sorted(hits, key=lambda x: (x.switch_anchor, x.delta_s)):
+        if out and (h.switch_anchor - out[-1]["hi"]).total_seconds() <= window_s:
+            m = out[-1]
+            m["hi"] = max(m["hi"], h.switch_anchor)
+            m["hits"].append(h)
         else:
-            gap = 0
-        if gap <= window_s:
-            out.append(e)
+            out.append({"lo": h.switch_anchor, "hi": h.switch_anchor, "hits": [h]})
     return out
 
 
-# Severity → card / chip styling class + label.
-_SEV_CLASS = {"nvl_fatal": "fatal", "nvl_non_fatal": "warn"}
-_SEV_LABEL = {"nvl_fatal": "NVL FATAL", "nvl_non_fatal": "NVL NON-FATAL"}
+def _anchor_index(events):
+    """Sorted ``([anchor], [event])`` index over every switch anchor, for the
+    context lookup that pulls same-moment events which did not match themselves."""
+    pairs = sorted(((a, i) for i, e in enumerate(events) for a in E_anchors(e)),
+                   key=lambda p: p[0])
+    return [p[0] for p in pairs], [p[1] for p in pairs]
 
 
-def _field_guide(res: Result) -> List[Tuple[str, str]]:
+def _context_events(index, events, lo, hi, window_s, exclude_ids):
+    """Switch events with an anchor inside the moment's window that are not
+    already part of it — the FNM loss / FM restart / raw failure sitting next to
+    a correlated event but a few seconds outside the compute match."""
+    ts, idx = index
+    a = bisect.bisect_left(ts, lo - timedelta(seconds=window_s))
+    b = bisect.bisect_right(ts, hi + timedelta(seconds=window_s))
+    out, seen = [], set()
+    for k in range(a, b):
+        e = events[idx[k]]
+        if id(e) in exclude_ids or id(e) in seen:
+            continue
+        seen.add(id(e))
+        out.append((ts[k], e))
+    return out
+
+
+def _field_guide(res: Result, kinds_present: List[str]) -> List[Tuple[str, str]]:
     """Term → meaning pairs for the 'How to read this report' glossary."""
-    return [
+    items = [
         ("compute-tray side",
          "events parsed from the analyze-nv-bug-report reports: Xid raw-log event "
          "groups (§7.3) and IMEX node-disconnect event groups (§6). All compute "
          "times are the tray's local clock."),
         ("switch side",
-         "events parsed from the nvos-tech-dump-tools-for-nmx-c report: NVLSM "
-         "port-state event groups and FNM port-loss highlights. All switch times "
-         "are the NVOS local clock ('switch raw')."),
-        ("nvos event group N",
-         "the N-th port-state cluster in the NVOS report — NVLSM port transitions "
-         "(ACTIVE→DOWN / DOWN→INIT) grouped by adaptive time clustering, with the "
-         "Fabric Manager rows from the same window attached."),
+         "events parsed from EVERY time-stamped section of the "
+         "nvos-tech-dump-tools-for-nmx-c report — not just the port-state groups. "
+         "All switch times are the NVOS local clock ('switch raw')."),
+        ("fabric moment / event card",
+         f"one §2 card = one instant of switch-side activity: every nvos event "
+         f"whose matched anchor falls within ±{res.window_s}s of the others, "
+         f"whatever section of the nvos report reported it."),
+        ("Source column",
+         "which nvos section an event came from — " + "; ".join(
+             f"{SWITCH_KIND_TAG[k]} = {SWITCH_KIND_LABEL[k]}"
+             for k in SWITCH_KIND_ORDER if k in kinds_present) + "."),
+        ("Match column",
+         f"±Ns = the event's anchor matched a compute-tray anchor N seconds away; "
+         f"'context' = the event sits inside the same moment window but its own "
+         f"anchor is more than ±{res.window_s}s from any compute anchor, so it is "
+         f"shown as corroborating evidence, not as a match."),
         ("[nvl_fatal] / [nvl_non_fatal] / [none]",
          "highest Fabric-Manager error category attached to that nvos event group: "
          "fatal NVLink error / non-fatal NVLink error / port transitions only."),
@@ -628,12 +702,10 @@ def _field_guide(res: Result) -> List[Tuple[str, str]]:
          "event-group numbers from the nv-bug-report cross-node report's merged "
          "timelines (§4 Xid Unified Timeline / §2 IMEX Node Disconnect Timeline) — "
          "look the group up there for the full raw log."),
-        ("FNM port loss",
-         "'FNM port loss' highlights from the NVOS report — the switch's FNM "
-         "access port dropping, matched to NVLSM transitions on the same switch."),
         ("anchor matching / window",
          f"an event contributes its start (and, if different, its end) as discrete "
-         f"anchor moments; two events correlate when any two anchors fall within "
+         f"anchor moments — clustered sources publish every distinct moment they "
+         f"contain; two events correlate when any two anchors fall within "
          f"±{res.window_s}s after the offset is applied. The span between start "
          f"and end is deliberately NOT treated as active."),
         ("timezone offset / switch raw",
@@ -655,15 +727,283 @@ def _field_guide(res: Result) -> List[Tuple[str, str]]:
          "NVLink sub-type and severity decoded from the NVRM line for Xid 144-150 "
          "(per the NVIDIA Server-RAS catalog); '-' where the driver emits no "
          "sub-type."),
+        ("GPU Node Mapping (not an event source)",
+         "the nvos report's GPU Node Mapping section is a GUID inventory with "
+         "first-seen / last-seen observation windows, not moments something "
+         "happened, so it is deliberately excluded from the correlation."),
     ]
+    per_kind = {
+        "port_state": ("nvos event group N",
+                       "the N-th port-state cluster in the NVOS report — NVLSM port "
+                       "transitions (ACTIVE→DOWN / DOWN→INIT) grouped by adaptive time "
+                       "clustering, with the Fabric Manager rows from the same window "
+                       "attached."),
+        "fm_outside": ("FM log outside port-state groups",
+                       "Fabric-Manager rows the nvos report lists under 'Fabric Manager "
+                       "log before/after earliest NVLSM event' — FM errors (often "
+                       "nvl_non_fatal or connection_lost) for which NVLSM logged no port "
+                       "transition, so they belong to no port-state group. Time-clustered "
+                       "here; this is the evidence a port-state-only correlation misses."),
+        "fnm_port_loss": ("FNM port loss",
+                          "'FNM port loss' highlights from the NVOS report — the switch's "
+                          "FNM access port dropping, matched to NVLSM transitions on the "
+                          "same switch."),
+        "fnm_nvlsm_unmatched": ("FNM loss seen only in NVLSM",
+                                "an NVLSM FNM port loss with no Fabric-Manager record in "
+                                "the matching window."),
+        "fnm_nvlsm_recovery": ("FNM NVLSM transition not linked to FM",
+                               "NVLSM FNM port transitions (usually DOWN→INIT recoveries) "
+                               "the nvos report could not tie back to an FM loss event."),
+        "switch_info_failure": ("Failed to get switch info",
+                                "FM lost its management connection to a switch — raw "
+                                "'[Mon DD YYYY HH:MM:SS] …' lines, time-clustered."),
+        "partition_error": ("Partition unexpected error state",
+                            "FM partition entered an unexpected error state — raw lines, "
+                            "time-clustered."),
+        "multicast_limit": ("Multicast team limit reached",
+                            "FM hit its multicast team limit — raw lines, time-clustered."),
+        "fm_lifecycle": ("FM lifecycle",
+                         "Fabric Manager start / stop / restart. An Xid landing on an FM "
+                         "restart usually means the fabric was reconfigured, not that a "
+                         "link failed."),
+        "nvlsm_health": ("NVLSM health check",
+                         "invalid-topology / invalid-UTF-8 counts; only the earliest and "
+                         "latest occurrence carry a timestamp, so only those two moments "
+                         "can correlate."),
+    }
+    for k in SWITCH_KIND_ORDER:
+        if k in kinds_present and k in per_kind:
+            items.append(per_kind[k])
+    return items
+
+
+def _fmt_delta(delta: Optional[int]) -> str:
+    return "context" if delta is None else f"±{delta}s"
+
+
+def _evidence_rows(entries, offset_min: int) -> List[List[str]]:
+    """Evidence-table rows for one moment: ``entries`` = [(anchor, event, delta)]."""
+    rows = []
+    for anchor, ev, delta in entries:
+        rows.append([
+            T.fmt(anchor),
+            T.fmt(T.shift(anchor, offset_min)),
+            SWITCH_KIND_TAG.get(ev.kind, ev.kind),
+            ev.severity,
+            ev.label,
+            ev.detail or "-",
+            _fmt_delta(delta),
+        ])
+    return rows
+
+
+_EVIDENCE_HEADERS = ["Switch time (raw)", "Tray time", "Source", "Severity",
+                     "Event", "Detail", "Match"]
+_EVIDENCE_NOTES = [
+    "The matched moment on the switch's own clock, exactly as the nvos report prints it.",
+    "The same moment expressed on the compute-tray clock (switch time + applied offset).",
+    "Which nvos report section the event came from — see the field guide's Source entry.",
+    "Worst Fabric-Manager category / severity carried by the event.",
+    "Short event label from the nvos report.",
+    "Category breakdown, transition, GUID or message digest, depending on the source.",
+    "±Ns = matched a compute-tray anchor that many seconds away; 'context' = same "
+    "moment window but no compute anchor of its own.",
+]
+
+
+def _xid_evidence(d: Doc, cross, xid_egs: List[int], tray_index_by_host: Dict[str, str]) -> None:
+    """The node-deduped Xid raw-log table for a moment's cross-node Xid groups."""
+    agg: dict = {}   # (xid, mnem, sev) -> {"ex": str, "hosts": [..]}
+    order: List[tuple] = []
+    for gid in xid_egs:
+        for entry in cross.xid_details.get(gid, []):
+            xid, mnem, sev_x, ex = entry[0], entry[1], entry[2], entry[3]
+            hosts = entry[4] if len(entry) > 4 else []
+            key = (xid, mnem, sev_x)
+            if key not in agg:
+                agg[key] = {"ex": ex, "hosts": []}
+                order.append(key)
+            for h in hosts:
+                if h not in agg[key]["hosts"]:
+                    agg[key]["hosts"].append(h)
+    # Suppressed-derivative counts per Xid number (from §4 "+N more … suppressed"),
+    # so the affected Xid row can flag "(+N more suppressed)" and fold in any
+    # hosts seen only in those notes.
+    sup_by_xid: dict = {}
+    for gid in xid_egs:
+        for host, text in cross.xid_suppressed.get(gid, []):
+            mm = _SUP_PARSE.search(text)
+            if not mm:
+                continue
+            dxid = mm.group(2)
+            s = sup_by_xid.setdefault(dxid, {"hosts": [], "count": 0})
+            s["count"] += int(mm.group(1))
+            if host and host not in s["hosts"]:
+                s["hosts"].append(host)
+    if not order:
+        return
+    xrows = []
+    for key in order:
+        xid, mnem, sev_x = key
+        hosts = list(agg[key]["hosts"])
+        sup = sup_by_xid.get(xid)
+        if sup:
+            for h in sup["hosts"]:
+                if h not in hosts:
+                    hosts.append(h)
+        hosts = sorted(hosts)
+        host_cell = ", ".join(hosts) or "-"
+        tray_cell = ", ".join(tray_index_by_host.get(h, "-") for h in hosts) or "-"
+        if sup:
+            tag = " (+ more suppressed)"
+            host_cell += tag
+            tray_cell += tag
+        xrows.append([xid, mnem or "-", sev_x or "-", host_cell, tray_cell, agg[key]["ex"]])
+    d.p("Xid raw log (cross-node Xid Event Group "
+        + ", ".join(str(i) for i in xid_egs) + ", deduped across nodes; "
+        "Hostname / Compute Tray Index list every compute tray that reported each Xid):")
+    d.table(
+        ["Xid", "Mnemonic", "Severity", "Hostname", "Compute Tray Index",
+         "Example NVRM raw log"], xrows,
+        col_notes=[
+            "NVIDIA Xid error number.",
+            "NVLink sub-type for Xid 144-150 (Server-RAS catalog); '-' = "
+            "the driver emitted no sub-type.",
+            "Fatal / Nonfatal as printed on the NVRM line.",
+            "Every compute tray whose log contains this Xid signature.",
+            "Fabric Manager tray index of each hostname (same order).",
+            "One representative raw line for the deduped signature.",
+        ],
+        badges={2}, mono_cols={5})
+    sup_seen = set()
+    for gid in xid_egs:
+        for host, text in cross.xid_suppressed.get(gid, []):
+            if (host, text) in sup_seen:
+                continue
+            sup_seen.add((host, text))
+            ti = tray_index_by_host.get(host, "")
+            d.p(f"{text} — {host}" + (f" [tray idx {ti}]" if ti else ""), note=True)
+
+
+def _fnm_evidence(d: Doc, d_events, window_s: int) -> None:
+    """FNM rows (all three nvos FNM tables) present in one moment."""
+    fnm = sorted((e for e in d_events if e.kind in FNM_KINDS), key=lambda e: e.start)
+    if not fnm:
+        return
+    rows = [[T.fmt(e.start), SWITCH_KIND_TAG.get(e.kind, e.kind),
+             e.extra.get("port", "-") or "-",
+             e.extra.get("down", "") or "-",
+             e.extra.get("peer_host", "") or "-",
+             e.extra.get("recovered", "") or "-",
+             e.extra.get("line", "") or "-"]
+            for e in fnm[:FM_ROW_CAP]]
+    d.p(f"FNM port loss (nvos Other FabricManager Log Highlights, within "
+        f"±{window_s}s):")
+    d.table(
+        ["FM Time", "Table", "Port", "Transition", "Peer host", "Recovered", "Log line"],
+        rows,
+        col_notes=[
+            "Switch clock (raw, unshifted).",
+            "Which FNM table in the nvos report the row came from.",
+            "FNM access port number on the switch.",
+            "NVLSM state change recorded for that FNM port.",
+            "NVOS hostname resolved for the affected switch.",
+            "Recovery time when a matching DOWN→INIT/ACTIVE was found; '-' = none.",
+            "nvlsm.log reference the nvos report cited for the row.",
+        ],
+        mono_cols={0, 6})
+    if len(fnm) > FM_ROW_CAP:
+        d.p(f"… +{len(fnm) - FM_ROW_CAP} more FNM event(s) suppressed", note=True)
+
+
+def _fm_log_evidence(d: Doc, d_events) -> None:
+    """Collapsed, de-duplicated Fabric Manager tables for a moment.
+
+    Both port-state groups and the 'outside the groups' clusters carry an FM
+    table in ``Event.extra``, so the same slimming applies to either.
+    """
+    for ev in sorted((e for e in d_events if e.kind in ("port_state", "fm_outside")),
+                     key=lambda e: e.start):
+        fm = _fm_slim_rows(ev)
+        if not fm:
+            continue
+        disp, frows, unique, total = fm
+        d.details_open(f"{ev.ref} — Fabric Manager rows in this window: "
+                       f"{unique} distinct error(s) / {total} row(s)")
+        d.table(
+            disp, frows,
+            col_notes=[
+                "Switch clock (raw, unshifted); a span means the same error "
+                "repeated over that range.",
+                "Fabric Manager log level.",
+                "FM error class: nvl_fatal / nvl_non_fatal (NVLink errors), "
+                "connection_lost (FM lost the GPU session).",
+                "Tray index(es) reporting this exact error (GPU Node Mapping).",
+                "FM error decode: Code/Subcode = NVLink error class / sub-reason, "
+                "portDownReasonCode, Status register.",
+            ],
+            badges={1, 2}, mono_cols={0})
+        if unique > FM_ROW_CAP:
+            d.p(f"… +{unique - FM_ROW_CAP} more distinct error(s) suppressed", note=True)
+        d.p("De-duplicated summary (merged by identical error); the full Fabric "
+            "Manager log stays in the nvos-tech-dump-tools-for-nmx-c report.",
+            note=True)
+        d.details_close()
+
+
+def _lifecycle_evidence(d: Doc, d_events) -> None:
+    life = sorted((e for e in d_events if e.kind == "fm_lifecycle"), key=lambda e: e.start)
+    if not life:
+        return
+    d.details_open(f"Fabric Manager lifecycle in this window ({len(life)} event(s))")
+    d.table(
+        ["Time", "Type", "Message"],
+        [[T.fmt(e.start), e.extra.get("type", "-"), e.extra.get("message", "") or "-"]
+         for e in life],
+        col_notes=[
+            "Switch clock (raw, unshifted).",
+            "start / stop / restart as classified by the nvos report.",
+            "The Fabric Manager log line that marked the transition.",
+        ],
+        mono_cols={0}, guide=True)
+    d.details_close()
+
+
+def _raw_evidence(d: Doc, d_events) -> None:
+    for ev in sorted((e for e in d_events if e.kind in RAW_KINDS), key=lambda e: e.start):
+        lines = ev.extra.get("lines") or []
+        if not lines:
+            continue
+        d.details_open(f"{ev.extra.get('topic', ev.kind)} @ {T.fmt(ev.start)} "
+                       f"({len(lines)} raw line(s))")
+        d.pre(lines[:RAW_LINE_CAP])
+        if len(lines) > RAW_LINE_CAP:
+            d.p(f"… +{len(lines) - RAW_LINE_CAP} more line(s) suppressed", note=True)
+        d.details_close()
 
 
 def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchReport],
-                 tz_mode: str = "auto", cross=None) -> Doc:
+                 tz_mode: str = "auto", cross=None, excluded_kinds=None) -> Doc:
     tray_index_by_host = {t.hostname: t.tray_index for t in trays if t.hostname}
+    excluded_kinds = set(excluded_kinds or ())
 
-    n_ps = sum(len(n.port_state_events) for s in switches for n in s.nodes)
-    n_fnm = sum(len(n.fnm_events) for s in switches for n in s.nodes)
+    all_switch_events = [e for s in switches for n in s.nodes for e in n.events]
+    considered = res.switch_events
+    kind_total: Dict[str, int] = {}
+    for e in considered:
+        kind_total[e.kind] = kind_total.get(e.kind, 0) + 1
+    matched_ids = {id(e) for e in res.matched_switch}
+    kind_matched: Dict[str, int] = {}
+    for e in considered:
+        if id(e) in matched_ids:
+            kind_matched[e.kind] = kind_matched.get(e.kind, 0) + 1
+    excluded_total: Dict[str, int] = {}
+    for e in all_switch_events:
+        if e.kind in excluded_kinds:
+            excluded_total[e.kind] = excluded_total.get(e.kind, 0) + 1
+    kinds_present = [k for k in SWITCH_KIND_ORDER if kind_total.get(k)]
+
+    n_ps = kind_total.get("port_state", 0)
     chassis = sorted({t.chassis_sn for t in trays if t.chassis_sn}
                      | {n.chassis for s in switches for n in s.nodes if n.chassis})
 
@@ -673,6 +1013,7 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
         ("window", f"±{res.window_s}s"),
         ("scope", "same-chassis" if res.chassis_scoped else "cross-chassis"),
         ("trays", str(len(trays))),
+        ("nvos events", f"{len(considered):,}"),
         ("chassis", ", ".join(chassis) if chassis else "?"),
     ])
 
@@ -687,15 +1028,22 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
         compute_line = (f"Compute trays (nv-bug-report): {len(trays)} — per-node Xid event "
                         f"groups: {n_xid}, IMEX event groups: {n_imex} (no cross-node report)")
 
-    d.bullets([
+    switch_line = (f"Switch dumps (NVOS/NMX-C): {len(switches)} — {len(considered):,} event(s) "
+                   f"across {len(kinds_present)} nvos section(s): "
+                   + ", ".join(f"{SWITCH_KIND_TAG[k]} {kind_total[k]:,}" for k in kinds_present))
+    bullets = [
         compute_line,
-        f"Switch dumps (NVOS/NMX-C): {len(switches)} — nvos event groups: {n_ps}, FNM port-loss events: {n_fnm}",
+        switch_line,
         f"Chassis (rack) key(s): {', '.join(chassis) if chassis else '(none detected)'}",
         f"Correlation window: ±{res.window_s}s | Timezone offset applied to switch side: "
         f"{_fmt_off(res.offset_min)}  [{TZ_MODE_LABEL.get(tz_mode, tz_mode)}]",
         f"Chassis-scoped correlation: {'yes' if res.chassis_scoped else 'no (cross-chassis allowed)'}",
-    ])
-    d.legend("How to read this report (field guide)", _field_guide(res))
+    ]
+    if excluded_total:
+        bullets.append("Excluded from correlation (--exclude-switch-kinds): "
+                       + ", ".join(f"{k} ({n:,})" for k, n in sorted(excluded_total.items())))
+    d.bullets(bullets)
+    d.legend("How to read this report (field guide)", _field_guide(res, kinds_present))
 
     # 1. Timezone alignment
     d.h(2, "1. Timezone Alignment")
@@ -730,78 +1078,103 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
     else:
         d.p("Not enough events on both sides to suggest an offset.", note=True)
 
-    # 2. Correlated events
+    # 2. Correlated events — one card per switch-side *moment*, across all
+    #    nvos sections rather than port-state groups only.
     d.h(2, "2. Correlated Events")
-    corr_xid_egs: set = set()   # cross-node Xid EG ids cited by any fabric group
-    corr_imex_egs: set = set()  # cross-node IMEX EG ids cited by any fabric group
-    if res.correlations:
-        # Invert compute→switch into switch→[compute]: one fold per switch (nvos)
-        # event, cross-referenced to the nvbr cross-node report's event groups.
-        # Fold only on port-state fabric groups; a matched FNM is surfaced inside the
-        # time-aligned fold (via _fnm_hits below), never as its own fold.
-        groups: dict = {}
-        for c in res.correlations:
-            for s, delta in c.switches:
-                if s.kind != "port_state":
-                    continue
-                key = (s.source_id, s.ref, s.kind, s.start)
-                g = groups.get(key)
-                if g is None:
-                    g = {"sw": s, "rows": []}
-                    groups[key] = g
-                g["rows"].append((c.compute, delta))
-        ordered = sorted(groups.values(), key=lambda g: g["sw"].start)
-        # Coverage is counted from what the folds actually DISPLAY, so the numbers
-        # match the report body exactly. A fold is one port-state fabric event that
-        # correlated with compute-tray Xid/IMEX; the FNM shown inside it is
-        # switch-side context (see _fnm_hits: same-clock proximity to the port-state
-        # group), NOT the engine's separate offset-based switch↔compute FNM match —
-        # counting the two from one source keeps them from disagreeing.
-        fnm_all = [e for s in switches for n in s.nodes for e in n.fnm_events]
-        fnm_shown_ids = {id(e) for g in ordered
-                         for e in _fnm_hits(fnm_all, g["sw"], res.window_s)}
-        d.p(f"{len(ordered)} of {n_ps} port-state event group(s) correlated with "
-            f"compute-tray Xid/IMEX (within ±{res.window_s}s at the applied offset); "
-            f"the remaining {n_ps - len(ordered)} had no compute-side Xid/IMEX in the "
-            f"same window (routine port flaps). {len(fnm_shown_ids)} FNM port-loss "
-            f"event(s) are surfaced as switch-side context within the folds below.")
-        d.p("Each fold is one port-state fabric event, cross-referenced to the nvbr "
-            "cross-node report's Xid / IMEX event group(s), with a node-deduped Xid "
-            "raw-log summary, any FNM port-loss events in the same switch-side window, "
-            "and the matching Fabric Manager log (nested, collapsed). The card header "
-            "shows the same moment on both clocks: switch raw time, the applied offset, "
-            "then the tray-clock time the compute side was matched against.", note=True)
+    corr_xid_egs: set = set()   # cross-node Xid EG ids cited by any fabric moment
+    corr_imex_egs: set = set()  # cross-node IMEX EG ids cited by any fabric moment
+    moments = _moments(res.hits, res.window_s)
+
+    cov_rows = [[SWITCH_KIND_TAG[k], SWITCH_KIND_LABEL[k], f"{kind_total[k]:,}",
+                 f"{kind_matched.get(k, 0):,}"] for k in kinds_present]
+    cov_rows.append(["ALL", "every nvos event source above", f"{len(considered):,}",
+                     f"{len(res.matched_switch):,}"])
+    d.p(f"{len(res.correlations)} compute-tray event(s) correlated with switch-side "
+        f"evidence, folded into {len(moments)} fabric moment(s). Coverage per nvos "
+        f"section:")
+    d.table(
+        ["Source", "nvos report section", "Events", "Correlated"], cov_rows,
+        col_notes=[
+            "Short tag used in the §2 evidence tables.",
+            "Where in the nvos-tech-dump-tools-for-nmx-c report the events come from.",
+            "How many events of that kind the nvos report(s) yielded.",
+            "How many of them landed within the correlation window of a compute-tray "
+            "Xid / IMEX anchor.",
+        ],
+        guide=True)
+
+    if moments:
+        d.p("Each card is one fabric moment: every nvos event whose anchor falls in the "
+            "same window, cross-referenced to the nvbr cross-node report's Xid / IMEX "
+            "event group(s). The evidence table lists all switch-side events at that "
+            "moment — port-state groups, Fabric-Manager rows outside those groups, FNM "
+            "port loss, switch-info / partition / multicast failures, FM lifecycle and "
+            "NVLSM health checks. The card header shows the same moment on both clocks: "
+            "switch raw time, the applied offset, then the tray-clock time the compute "
+            "side was matched against.", note=True)
         if cross is None:
-            d.p("nvbr cross-node report not found among the inputs — folds fall back to "
+            d.p("nvbr cross-node report not found among the inputs — cards fall back to "
                 "compute-event counts instead of cross-node event-group numbers.", note=True)
 
-        # HTML-only anchor navigation: one chip per correlated fabric event.
-        chip_items = []
-        fold_infos = []
-        for i, g in enumerate(ordered):
-            sw = g["sw"]
-            m = _REF_NUM.search(sw.ref or "")
-            num = m.group(1) if m else str(i + 1)
-            anchor = f"nvos-eg-{num}-{i}"
-            sev = sw.extra.get("severity")
-            sev_class = _SEV_CLASS.get(sev, "neutral")
-            chip_items.append({"anchor": anchor, "ref": f"G{num}",
-                               "dt": T.shift(sw.start, res.offset_min).strftime("%m-%d %H:%M"),
-                               "sev_class": sev_class})
-            fold_infos.append((anchor, sev, sev_class))
-        if chip_items:
-            d.chips("Correlated fabric events", chip_items)
+        index = _anchor_index(considered)
 
-        for i, g in enumerate(ordered):
-            sw = g["sw"]
-            comp_rows = g["rows"]
-            is_xid = any(ce.kind == "xid" for ce, _ in comp_rows)
-            anchor, sev, sev_class = fold_infos[i]
-            sev_tag = f"[{sev}] " if sev else ""
+        # Resolve each moment's switch events (matched + same-window context) up
+        # front so the chip strip and the cards agree on severity and labels.
+        cards = []
+        for i, m in enumerate(moments):
+            per: Dict[int, Dict] = {}
+            comp: List = []
+            comp_seen = set()
+            for h in m["hits"]:
+                cur = per.get(id(h.switch))
+                if cur is None or h.delta_s < cur["delta"]:
+                    per[id(h.switch)] = {"ev": h.switch, "anchor": h.switch_anchor,
+                                         "delta": h.delta_s}
+                if id(h.compute) not in comp_seen:
+                    comp_seen.add(id(h.compute))
+                    comp.append(h.compute)
+            entries = [(v["anchor"], v["ev"], v["delta"]) for v in per.values()]
+            ctx = _context_events(index, considered, m["lo"], m["hi"], res.window_s,
+                                  set(per))
+            entries.extend((a, e, None) for a, e in ctx)
+            entries.sort(key=lambda t: (SWITCH_KIND_ORDER.index(t[1].kind)
+                                        if t[1].kind in SWITCH_KIND_ORDER else 99, t[0]))
+            events = [e for _a, e, _d in entries]
+            # Name and colour the card from the events that actually matched, so
+            # a context-only neighbour never gets credited with the correlation.
+            # entries are ordered by SWITCH_KIND_ORDER, so the first one is the
+            # moment's most diagnostic evidence.
+            naming = [e for _a, e, dl in entries if dl is not None] or events
+            sev = worst_severity(e.severity for e in naming)
+            ps_refs = [e.ref for e in naming if e.kind == "port_state"]
+            if ps_refs:
+                ref = "; ".join(ps_refs[:3]) + (f" +{len(ps_refs) - 3}" if len(ps_refs) > 3 else "")
+                mm = _REF_NUM.search(ps_refs[0])
+                nav = f"G{mm.group(1)}" if mm else "PORT"
+            else:
+                ref = naming[0].label
+                nav = SWITCH_KIND_TAG.get(naming[0].kind, "EVT")
+            # The card header quotes the naming event's own anchor, so its time
+            # and its title always describe the same thing.
+            head = next(a for a, e, _dl in entries if e is naming[0])
+            cards.append({"m": m, "entries": entries, "events": events,
+                          "comp": comp, "sev": sev, "ref": ref, "nav": nav,
+                          "head": head, "anchor": f"moment-{i + 1}",
+                          "sev_class": _SEV_CLASS.get(sev, "neutral")})
+
+        d.chips("Correlated fabric moments", [
+            {"anchor": c["anchor"], "ref": c["nav"],
+             "dt": T.shift(c["head"], res.offset_min).strftime("%m-%d %H:%M"),
+             "sev_class": c["sev_class"]} for c in cards])
+
+        for c in cards:
+            m, entries, events, comp = c["m"], c["entries"], c["events"], c["comp"]
+            is_xid = any(ce.kind == "xid" for ce in comp)
+            sev = c["sev"]
             xid_egs = sorted({_xref(cross, "xid", ce.start, res.window_s)
-                              for ce, _ in comp_rows if ce.kind == "xid"} - {None})
+                              for ce in comp if ce.kind == "xid"} - {None})
             imex_egs = sorted({_xref(cross, "imex", ce.start, res.window_s)
-                               for ce, _ in comp_rows if ce.kind == "imex"} - {None})
+                               for ce in comp if ce.kind == "imex"} - {None})
             corr_xid_egs.update(xid_egs)
             corr_imex_egs.update(imex_egs)
             parts = []
@@ -809,134 +1182,32 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
                 parts.append("Xid Event Group " + ", ".join(str(i) for i in xid_egs))
             if imex_egs:
                 parts.append("IMEX Event Group " + ", ".join(str(i) for i in imex_egs))
-            xref = ("nvbr " + "; ".join(parts)) if parts else f"{len(comp_rows)} compute event(s)"
-            t_tray = T.fmt(T.shift(sw.start, res.offset_min))
-            t_raw = T.fmt(sw.start)
+            xref = ("nvbr " + "; ".join(parts)) if parts else f"{len(comp)} compute event(s)"
+            t_tray = T.fmt(T.shift(c["head"], res.offset_min))
+            t_raw = T.fmt(c["head"])
+            n_kinds = len({e.kind for e in events})
+            sev_tag = f"[{sev}] " if sev and sev != "none" else ""
             d.fold_open(
-                f"{sw.ref} {sev_tag}@ {t_tray} (switch raw {t_raw}) ↔ {xref}",
-                {"anchor": anchor, "ref": sw.ref, "sev_class": sev_class,
+                f"{c['ref']} {sev_tag}@ {t_tray} (switch raw {t_raw}) ↔ {xref}",
+                {"anchor": c["anchor"], "ref": c["ref"], "nav": c["nav"],
+                 "sev_class": c["sev_class"],
                  "sev_label": _SEV_LABEL.get(sev, "PORT EVENT"),
                  "kind_label": "XID" if is_xid else "IMEX",
                  "t_raw": t_raw, "t_tray": t_tray,
                  "off": _fmt_off_short(res.offset_min), "xref": xref, "red": is_xid})
+
+            d.p(f"Switch-side evidence at this moment — {len(events)} nvos event(s) "
+                f"from {n_kinds} report section(s):")
+            d.table(_EVIDENCE_HEADERS, _evidence_rows(entries, res.offset_min),
+                    col_notes=_EVIDENCE_NOTES, badges={3}, mono_cols={0, 1}, guide=True)
+
             if cross is not None and xid_egs:
-                agg: dict = {}   # (xid, mnem, sev) -> {"ex": str, "hosts": [..]}
-                order: List[tuple] = []
-                for gid in xid_egs:
-                    for entry in cross.xid_details.get(gid, []):
-                        xid, mnem, sev_x, ex = entry[0], entry[1], entry[2], entry[3]
-                        hosts = entry[4] if len(entry) > 4 else []
-                        key = (xid, mnem, sev_x)
-                        if key not in agg:
-                            agg[key] = {"ex": ex, "hosts": []}
-                            order.append(key)
-                        for h in hosts:
-                            if h not in agg[key]["hosts"]:
-                                agg[key]["hosts"].append(h)
-                # Suppressed-derivative counts per Xid number (from §4 "+N more …
-                # suppressed"), so the affected Xid row can flag "(+N more
-                # suppressed)" and fold in any hosts seen only in those notes.
-                sup_by_xid: dict = {}
-                for gid in xid_egs:
-                    for host, text in cross.xid_suppressed.get(gid, []):
-                        mm = _SUP_PARSE.search(text)
-                        if not mm:
-                            continue
-                        dxid = mm.group(2)
-                        s = sup_by_xid.setdefault(dxid, {"hosts": [], "count": 0})
-                        s["count"] += int(mm.group(1))
-                        if host and host not in s["hosts"]:
-                            s["hosts"].append(host)
-                if order:
-                    xrows = []
-                    for key in order:
-                        xid, mnem, sev_x = key
-                        hosts = list(agg[key]["hosts"])
-                        sup = sup_by_xid.get(xid)
-                        if sup:
-                            for h in sup["hosts"]:
-                                if h not in hosts:
-                                    hosts.append(h)
-                        hosts = sorted(hosts)
-                        host_cell = ", ".join(hosts) or "-"
-                        tray_cell = ", ".join(tray_index_by_host.get(h, "-") for h in hosts) or "-"
-                        if sup:
-                            tag = " (+ more suppressed)"
-                            host_cell += tag
-                            tray_cell += tag
-                        xrows.append([xid, mnem or "-", sev_x or "-",
-                                      host_cell, tray_cell, agg[key]["ex"]])
-                    d.p("Xid raw log (cross-node Xid Event Group "
-                        + ", ".join(str(i) for i in xid_egs) + ", deduped across nodes; "
-                        "Hostname / Compute Tray Index list every compute tray that reported each Xid):")
-                    d.table(
-                        ["Xid", "Mnemonic", "Severity", "Hostname", "Compute Tray Index",
-                         "Example NVRM raw log"], xrows,
-                        col_notes=[
-                            "NVIDIA Xid error number.",
-                            "NVLink sub-type for Xid 144-150 (Server-RAS catalog); '-' = "
-                            "the driver emitted no sub-type.",
-                            "Fatal / Nonfatal as printed on the NVRM line.",
-                            "Every compute tray whose log contains this Xid signature.",
-                            "Fabric Manager tray index of each hostname (same order).",
-                            "One representative raw line for the deduped signature.",
-                        ],
-                        badges={2}, mono_cols={5})
-                    sup_seen = set()
-                    for gid in xid_egs:
-                        for host, text in cross.xid_suppressed.get(gid, []):
-                            if (host, text) in sup_seen:
-                                continue
-                            sup_seen.add((host, text))
-                            ti = tray_index_by_host.get(host, "")
-                            d.p(f"{text} — {host}" + (f" [tray idx {ti}]" if ti else ""),
-                                note=True)
-            fnm = _fnm_hits(fnm_all, sw, res.window_s)
-            if fnm:
-                fnm = sorted(fnm, key=lambda e: e.start)
-                frows = [[T.fmt(e.start), e.extra.get("port", "-"),
-                          e.extra.get("down", "") or "-",
-                          e.extra.get("peer_host", "") or "-",
-                          e.extra.get("recovered", "") or "-"]
-                         for e in fnm[:FM_ROW_CAP]]
-                d.p(f"FNM port loss (nvos Other FabricManager Log Highlights, within "
-                    f"±{res.window_s}s):")
-                d.table(
-                    ["FM Time", "Port", "Transition", "Peer host", "Recovered"], frows,
-                    col_notes=[
-                        "Switch clock (raw, unshifted).",
-                        "FNM access port number on the switch.",
-                        "NVLSM state change recorded for that FNM port.",
-                        "NVOS hostname resolved for the affected switch.",
-                        "Recovery time when a matching DOWN→INIT/ACTIVE was found; '-' = none.",
-                    ],
-                    mono_cols={0})
-                if len(fnm) > FM_ROW_CAP:
-                    d.p(f"… +{len(fnm) - FM_ROW_CAP} more FNM event(s) suppressed", note=True)
-            fm = _fm_slim_rows(sw)
-            if fm:
-                disp, frows, unique, total = fm
-                d.details_open(f"Fabric Manager log — {sw.ref} (same time window): "
-                               f"{unique} distinct error(s) / {total} FM rows")
-                d.table(
-                    disp, frows,
-                    col_notes=[
-                        "Switch clock (raw, unshifted); a span means the same error "
-                        "repeated over that range.",
-                        "Fabric Manager log level.",
-                        "FM error class: nvl_fatal / nvl_non_fatal (NVLink errors), "
-                        "connection_lost (FM lost the GPU session).",
-                        "Tray index(es) reporting this exact error (GPU Node Mapping).",
-                        "FM error decode: Code/Subcode = NVLink error class / sub-reason, "
-                        "portDownReasonCode, Status register.",
-                    ],
-                    badges={1, 2}, mono_cols={0})
-                if unique > FM_ROW_CAP:
-                    d.p(f"… +{unique - FM_ROW_CAP} more distinct error(s) suppressed", note=True)
-                d.p("This is a de-duplicated summary (merged by error); for the full "
-                    "Fabric Manager log see the nvos-tech-dump-tools-for-nmx-c report "
-                    f"for {sw.ref}.", note=True)
-                d.details_close()
+                _xid_evidence(d, cross, xid_egs, tray_index_by_host)
+            _compute_evidence(d, comp, c["head"], res.offset_min, tray_index_by_host)
+            _fnm_evidence(d, events, res.window_s)
+            _lifecycle_evidence(d, events)
+            _fm_log_evidence(d, events)
+            _raw_evidence(d, events)
             d.details_close()
     else:
         d.p("No compute-tray event correlated with any switch event at the applied "
@@ -946,7 +1217,7 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
     d.h(2, "3. Uncorrelated Compute-Tray Events")
     if cross is not None:
         d.p("Cross-node event groups (nvbr cross-node report) that did NOT time-correlate "
-            "with any switch fabric event in §2 (cross-node granularity).")
+            "with any switch-side nvos event in §2 (cross-node granularity).")
         un_xid = [g for g in sorted(cross.xid_groups) if g[0] not in corr_xid_egs]
         xid_sum = (f"Xid: {len(un_xid)} of {len(cross.xid_groups)} cross-node Xid Event "
                    f"Group(s) uncorrelated")
@@ -968,6 +1239,9 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
                 ],
                 mono_cols={1, 2}, guide=True)
             d.details_close()
+            d.p("With every nvos section correlated, an uncorrelated Xid group means the "
+                "switch side logged nothing at all in that window — the fault did not "
+                "reach the fabric, or the dump does not cover that time range.", note=True)
         else:
             d.p(xid_sum + ".")
         un_imex = [g for g in sorted(cross.imex_groups) if g[0] not in corr_imex_egs]
@@ -1020,3 +1294,35 @@ def build_report(res: Result, trays: List[TrayReport], switches: List[SwitchRepo
                 "rather than a switch fabric fault.", note=True)
 
     return d
+
+
+def _compute_evidence(d: Doc, comp, head_anchor, offset_min: int,
+                      tray_index_by_host: Dict[str, str]) -> None:
+    """Collapsed list of the compute-tray event groups this moment matched."""
+    if not comp:
+        return
+    ref_tray = T.shift(head_anchor, offset_min)
+    rows = []
+    for ce in sorted(comp, key=lambda e: (e.kind != "xid", e.start)):
+        rows.append([
+            T.fmt(ce.start), ce.kind.upper(), ce.source_id or "-",
+            tray_index_by_host.get(ce.source_id, "-") or "-",
+            ce.label, ce.ref,
+            f"{int((ce.start - ref_tray).total_seconds()):+d}s",
+        ])
+    d.details_open(f"Compute-tray events matched at this moment ({len(rows)})")
+    d.table(
+        ["Tray time", "Kind", "Tray", "Tray idx", "Event", "Per-tray ref", "Δ vs moment"],
+        rows,
+        col_notes=[
+            "Event group start on the compute-tray clock.",
+            "XID = GPU Xid raw-log group; IMEX = IMEX node-disconnect group.",
+            "Compute-tray hostname the event came from.",
+            "Fabric Manager tray index for that hostname.",
+            "Short event label from the per-node nv-bug-report.",
+            "Event-group number inside THAT tray's own report — not the cross-node "
+            "group cited in the card header.",
+            "Signed offset from the moment's switch anchor expressed on the tray clock.",
+        ],
+        mono_cols={0, 6}, guide=True)
+    d.details_close()

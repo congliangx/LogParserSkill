@@ -4,13 +4,16 @@ Correlate compute-tray (nv-bug-report) and NVOS/NMX-C dump reports by time.
 
 Reads the Markdown reports produced by the analyze-nv-bug-report and
 nvos-tech-dump-tools-for-nmx-c skills, extracts time-stamped event groups
-(compute: Xid + IMEX; switch: port-state + FNM port loss), and reports events
-that overlap in time — accounting for a timezone offset between the two sources.
+(compute: Xid + IMEX; switch: EVERY time-stamped nvos section — port-state
+groups, Fabric-Manager rows outside those groups, FNM port loss, switch-info /
+partition / multicast failures, FM lifecycle, NVLSM health checks) and reports
+events that overlap in time — accounting for a timezone offset between the two
+sources.
 
 Usage:
   python correlate.py <report.md | dir> [more ...] -o OUT
       [--tz-offset-minutes N] [--auto-tz | --interactive-tz]
-      [--window-seconds S] [--cross-chassis]
+      [--window-seconds S] [--cross-chassis] [--exclude-switch-kinds K,...]
 
 Inputs may be individual report .md files and/or directories (scanned for
 *.md). Each file is auto-classified as nv-bug-report or NVOS; anything else
@@ -34,7 +37,13 @@ from pathlib import Path
 from typing import List, Tuple
 
 from correlation_xid.engine import correlate, gather_compute, gather_switch, suggest_offsets
-from correlation_xid.models import CrossNodeReport, SwitchReport, TrayReport
+from correlation_xid.models import (
+    SWITCH_KIND_LABEL,
+    SWITCH_KIND_ORDER,
+    CrossNodeReport,
+    SwitchReport,
+    TrayReport,
+)
 from correlation_xid.parsers import parse_report
 from correlation_xid.render import build_report
 
@@ -136,13 +145,28 @@ def main(argv=None) -> int:
                     help="Overlap tolerance for 'same time window' (default 120).")
     ap.add_argument("--cross-chassis", action="store_true",
                     help="Correlate across different chassis serials (default: same chassis only).")
+    ap.add_argument("--exclude-switch-kinds", default="",
+                    help="Comma-separated nvos event kinds to leave out of the correlation "
+                         "(default: none — every nvos section participates). Choices: "
+                         + ", ".join(SWITCH_KIND_ORDER))
     args = ap.parse_args(argv)
+
+    exclude_kinds = {k.strip() for k in args.exclude_switch_kinds.split(",") if k.strip()}
+    unknown = exclude_kinds - set(SWITCH_KIND_ORDER)
+    if unknown:
+        print(f"Error: unknown --exclude-switch-kinds value(s): {', '.join(sorted(unknown))}\n"
+              "Valid kinds:\n"
+              + "\n".join(f"  {k:<22}{SWITCH_KIND_LABEL[k]}" for k in SWITCH_KIND_ORDER),
+              file=sys.stderr)
+        return 2
 
     trays: List[TrayReport] = []
     switches: List[SwitchReport] = []
     crosses: List[CrossNodeReport] = []
     for path in _discover_md(args.input):
-        kind, rep = parse_report(path)
+        # Flat nvos sources (FM rows, raw log blocks) are time-clustered at the
+        # correlation window so a cluster never spans further than a match would.
+        kind, rep = parse_report(path, cluster_gap_s=args.window_seconds)
         if kind == "nvbug":
             trays.append(rep)
         elif kind == "nvos":
@@ -167,7 +191,8 @@ def main(argv=None) -> int:
     offset = manual if manual is not None else 0
     tz_mode = "manual" if manual is not None else "default"
     if args.auto_tz or args.interactive_tz:
-        sugg = suggest_offsets(gather_compute(trays), gather_switch(switches),
+        sugg = suggest_offsets(gather_compute(trays),
+                               gather_switch(switches, exclude_kinds),
                                args.window_seconds, scoped)
         proposed, prop_from_sweep = offset, False
         if sugg and sugg[0][1] > 0:
@@ -184,17 +209,23 @@ def main(argv=None) -> int:
             tz_mode = "auto"
 
     res = correlate(trays, switches, offset_min=offset,
-                    window_s=args.window_seconds, scoped=scoped)
+                    window_s=args.window_seconds, scoped=scoped,
+                    exclude_kinds=exclude_kinds)
 
-    doc = build_report(res, trays, switches, tz_mode=tz_mode, cross=cross)
+    doc = build_report(res, trays, switches, tz_mode=tz_mode, cross=cross,
+                       excluded_kinds=exclude_kinds)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     md_path = args.output_dir / f"{args.name}.md"
     html_path = args.output_dir / f"{args.name}.html"
     md_path.write_text(doc.render_md(), encoding="utf-8")
     html_path.write_text(doc.render_html(), encoding="utf-8")
 
+    kinds: dict = {}
+    for e in res.matched_switch:
+        kinds[e.kind] = kinds.get(e.kind, 0) + 1
     print(f"Correlated {len(res.correlations)} compute event(s); "
-          f"{len(res.matched_switch)}/{res.total_switch} switch events matched; "
+          f"{len(res.matched_switch)}/{res.total_switch} switch events matched "
+          f"({', '.join(f'{k} {n}' for k, n in sorted(kinds.items())) or 'none'}); "
           f"offset {offset:+d} min [{tz_mode}].", file=sys.stderr)
     print(f"Wrote {md_path}")
     print(f"Wrote {html_path}")
