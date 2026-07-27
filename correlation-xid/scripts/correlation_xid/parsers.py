@@ -1,7 +1,32 @@
 """Parse the Markdown reports of the two source skills into the shared model.
 
 nv-bug-report (compute tray)  -> TrayReport   (Xid + IMEX event groups)
-NVOS / NMX-C dump (switch)    -> SwitchReport (port-state groups + FNM port loss)
+NVOS / NMX-C dump (switch)    -> SwitchReport (**every** time-stamped section)
+
+On the switch side the parser walks each node section end to end and emits an
+``Event`` for every time-stamped source the nvos report renders:
+
+===========================  ==================================================
+kind                         nvos report section
+===========================  ==================================================
+``port_state``               ``#### Port state event groups`` (all 3 severities)
+``fm_outside``               ``Fabric Manager log before/after earliest NVLSM
+                             event`` — the FM rows that fall **outside** every
+                             port-state group, clustered in time
+``fnm_port_loss``            ``#### FNM port loss`` — FM FNM loss table
+``fnm_nvlsm_unmatched``      ``#### FNM port loss`` — unmatched NVLSM loss table
+``fnm_nvlsm_recovery``       ``#### FNM port loss`` — NVLSM rows with no FM link
+``switch_info_failure``      ``#### Failed to get switch info`` (raw block)
+``partition_error``          ``#### Partition unexpected error state`` (raw)
+``multicast_limit``          ``#### Multicast team limit reached`` (raw)
+``fm_lifecycle``             ``#### FM lifecycle``
+``nvlsm_health``             invalid-topology / invalid-UTF-8 health table
+===========================  ==================================================
+
+``### GPU Node Mapping`` is deliberately **not** an event source: its
+first-seen / last-seen columns describe an observation window for a GPU GUID
+inventory, not a moment something happened, so correlating it would manufacture
+matches for every slot.
 
 Parsing is by regex over the rendered Markdown (the reports are the contract).
 See ``models.py`` for the shapes produced.
@@ -11,14 +36,26 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import timeutil as T
-from .models import CrossNodeReport, Event, SwitchNode, SwitchReport, TrayReport
+from .models import (
+    CrossNodeReport,
+    Event,
+    SwitchNode,
+    SwitchReport,
+    TrayReport,
+    worst_severity,
+)
 
 NVBUG_TITLE = "# NVIDIA Bug Report Analysis"
 NVOS_TITLE = "# NMX-C Log Analysis Report"
 NVBUG_CROSS_TITLE = "# Multi-Node Xid Comparison Report"
+
+# Idle gap that starts a new cluster when a section is a flat row/line stream
+# (FM rows outside port-state groups, raw log blocks). Overridden by the CLI so
+# the clustering granularity tracks the correlation window.
+DEFAULT_CLUSTER_GAP_S = 120
 
 
 def classify(text: str) -> Optional[str]:
@@ -46,6 +83,113 @@ def _slice(text: str, start_pat: str, end_pats: Tuple[str, ...]) -> str:
         if me:
             end = min(end, start + me.start())
     return text[start:end]
+
+
+# ---------------------------------------------------------------------------
+# Generic Markdown readers (tables / details blocks / fenced raw text)
+# ---------------------------------------------------------------------------
+
+def _cells(line: str) -> List[str]:
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _is_separator(cells: Sequence[str]) -> bool:
+    return bool(cells) and all(re.fullmatch(r"[-: ]*", c) for c in cells)
+
+
+def _read_table(text: str, pos: int) -> Tuple[List[str], List[List[str]]]:
+    """Read the first Markdown pipe table at/after ``pos``.
+
+    Returns ``(headers, rows)``. Reading stops at the first non-table line once
+    the body started, and bails out if the enclosing block ends (``</details>``,
+    a heading, or the next ``<summary>``) before a table appears.
+    """
+    headers: List[str] = []
+    rows: List[List[str]] = []
+    started = False
+    for line in text[pos:].splitlines():
+        s = line.strip()
+        if not s.startswith("|"):
+            if started:
+                break
+            if s.startswith("</details>") or s.startswith("#") or s.startswith("<summary>"):
+                break
+            continue
+        cv = _cells(s)
+        if _is_separator(cv):
+            continue
+        if not started:
+            headers, started = cv, True
+        else:
+            rows.append(cv)
+    return headers, rows
+
+
+def _summary_pos(region: str, needle: str) -> int:
+    """End offset of the ``<summary>`` line containing ``needle`` (-1 if none).
+
+    The nvos renderer may wrap a summary in ``<strong>`` / a red ``<span>``, so
+    the match is a substring test rather than an exact one.
+    """
+    for m in re.finditer(r"^<summary>.*$", region, re.M):
+        if needle in m.group(0):
+            return m.end()
+    return -1
+
+
+def _table_under(region: str, needle: str) -> List[Dict[str, str]]:
+    """Rows (as header->value dicts) of the table under the ``needle`` summary."""
+    pos = _summary_pos(region, needle)
+    if pos < 0:
+        return []
+    headers, rows = _read_table(region, pos)
+    if not headers:
+        return []
+    return [{h: (r[i] if i < len(r) else "") for i, h in enumerate(headers)}
+            for r in rows]
+
+
+def _val(row: Dict[str, str], *names: str) -> str:
+    """First non-empty value among ``names``, stripped of Markdown code ticks."""
+    for n in names:
+        v = (row.get(n) or "").strip().strip("`").strip()
+        if v:
+            return v
+    return ""
+
+
+def _fenced_lines(region: str) -> List[str]:
+    """Lines of the first ```` ```text ```` fenced block in ``region``."""
+    m = re.search(r"^```text\s*$", region, re.M)
+    if not m:
+        return []
+    rest = region[m.end():]
+    end = re.search(r"^```\s*$", rest, re.M)
+    body = rest[:end.start()] if end else rest
+    return [ln for ln in body.splitlines() if ln.strip()]
+
+
+def _cluster(items: List[Tuple[datetime, object]], gap_s: int
+             ) -> List[List[Tuple[datetime, object]]]:
+    """Split time-sorted ``(ts, payload)`` pairs whenever the idle gap exceeds
+    ``gap_s``."""
+    out: List[List[Tuple[datetime, object]]] = []
+    cur: List[Tuple[datetime, object]] = []
+    last: Optional[datetime] = None
+    for ts, payload in sorted(items, key=lambda x: x[0]):
+        if cur and last is not None and (ts - last).total_seconds() > gap_s:
+            out.append(cur)
+            cur = []
+        cur.append((ts, payload))
+        last = ts
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _anchor_list(times: Sequence[datetime]) -> List[datetime]:
+    """Distinct, sorted moments a clustered event publishes as match anchors."""
+    return sorted(set(times))
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +344,10 @@ _NVOS_GRP_RE = re.compile(
     r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
 )
 
+# Section boundaries inside one node section.
+_NVLSM_SECTION = r"^### NVLSM & FM log checks"
+_HIGHLIGHTS_SECTION = r"^### Other FabricManager Log Highlights"
+
 
 def _nvos_node_identity(title: str) -> Tuple[str, str]:
     """(chassis, hostname) from a node title like
@@ -216,7 +364,8 @@ def _nvos_node_identity(title: str) -> Tuple[str, str]:
     return chassis, hostname
 
 
-def parse_nvos(path: str, text: str) -> SwitchReport:
+def parse_nvos(path: str, text: str,
+               cluster_gap_s: int = DEFAULT_CLUSTER_GAP_S) -> SwitchReport:
     rep = SwitchReport(path=path)
     # Split into node sections at level-2 headings (skip the doc H1).
     title_positions = [(m.start(), m.group(1)) for m in _NODE_TITLE_RE.finditer(text)]
@@ -225,11 +374,28 @@ def parse_nvos(path: str, text: str) -> SwitchReport:
         section = text[pos:end]
         chassis, hostname = _nvos_node_identity(title)
         node = SwitchNode(title=title, hostname=hostname, chassis=chassis)
+
+        nvlsm_region = _slice(section, _NVLSM_SECTION, (r"^### ",))
+        highlights = _slice(section, _HIGHLIGHTS_SECTION, (r"^## ",))
+
         _parse_nvos_port_state(node, section)
-        _parse_nvos_fnm(node, section)
+        _parse_nvos_fm_outside(node, nvlsm_region, cluster_gap_s)
+        _parse_nvos_health(node, nvlsm_region)
+        _parse_nvos_fnm(node, highlights)
+        _parse_nvos_raw_blocks(node, highlights, cluster_gap_s)
+        _parse_nvos_lifecycle(node, highlights)
+
+        node.events.sort(key=lambda e: e.start)
         rep.nodes.append(node)
     return rep
 
+
+def _mk(node: SwitchNode, **kw) -> Event:
+    return Event(source_kind="switch", source_id=node.hostname or node.title[:24],
+                 chassis=node.chassis, **kw)
+
+
+# -- port-state event groups -------------------------------------------------
 
 def _parse_nvos_port_state(node: SwitchNode, section: str) -> None:
     region = _slice(section, r"^#### Port state event groups",
@@ -237,7 +403,6 @@ def _parse_nvos_port_state(node: SwitchNode, section: str) -> None:
     if not region:
         return
     matches = list(_NVOS_GRP_RE.finditer(region))
-    severity = "none"
     # Track which severity sub-bucket we are in as we walk the region.
     sev_markers = [(m.start(), _sev_of(m.group(0)))
                    for m in re.finditer(r"Event groups with Xid \((nvl_fatal|nvl_non_fatal)\) events"
@@ -254,9 +419,8 @@ def _parse_nvos_port_state(node: SwitchNode, section: str) -> None:
         ad = len(re.findall(r"ACTIVE→DOWN", block))
         di = len(re.findall(r"DOWN→INIT", block))
         fm_header, fm_rows, fm_total = _parse_fm_table(block)
-        node.port_state_events.append(Event(
-            source_kind="switch", source_id=node.hostname or node.title[:24],
-            chassis=node.chassis, kind="port_state", start=start, end=end or start,
+        node.events.append(_mk(
+            node, kind="port_state", start=start, end=end or start,
             label=f"port-state group [{severity}]",
             detail=f"ACTIVE→DOWN x{ad}, DOWN→INIT x{di}",
             ref=f"nvos event group {gid}",
@@ -268,24 +432,29 @@ def _parse_nvos_port_state(node: SwitchNode, section: str) -> None:
 def _parse_fm_table(block: str):
     """Extract the nested 'Fabric Manager log (same time window)' markdown table
     from one port-state event-group block. Returns (header, rows, total) where
-    rows is [(cells, count)] deduped by identical full row, first-seen order."""
-    mi = block.find("Fabric Manager log")
-    if mi < 0:
-        return [], [], 0
-    lines = [ln for ln in block[mi:].splitlines() if ln.lstrip().startswith("|")]
-    if len(lines) < 2:
-        return [], [], 0
+    rows is [(cells, count)] deduped by identical full row, first-seen order.
 
-    def cells(ln: str) -> List[str]:
-        return [c.strip() for c in ln.strip().strip("|").split("|")]
+    The read is bounded to that one table: the *last* event group's block runs to
+    the end of the section, which also holds the two 'Fabric Manager log
+    before/after earliest NVLSM event' tables — those belong to ``fm_outside``,
+    not to the group.
+    """
+    pos = _summary_pos(block, "Fabric Manager log (same time window)")
+    if pos < 0:
+        return [], [], 0
+    header, rows = _read_table(block, pos)
+    if not header:
+        return [], [], 0
+    return (header,) + _dedupe_rows(rows)
 
-    header = cells(lines[0])
-    counts: dict = {}
+
+def _dedupe_rows(rows) -> Tuple[List[Tuple[List[str], int]], int]:
+    """Collapse identical rows: ``([(cells, count)], total)`` in first-seen order."""
+    counts: Dict[tuple, int] = {}
     order: List[tuple] = []
     total = 0
-    for ln in lines[1:]:
-        cv = cells(ln)
-        if cv and all(re.fullmatch(r"[-: ]*", c) for c in cv):   # separator row
+    for cv in rows:
+        if _is_separator(cv):
             continue
         total += 1
         key = tuple(cv)
@@ -293,7 +462,7 @@ def _parse_fm_table(block: str):
             counts[key] = 0
             order.append(key)
         counts[key] += 1
-    return header, [(list(k), counts[k]) for k in order], total
+    return [(list(k), counts[k]) for k in order], total
 
 
 def _sev_of(marker: str) -> str:
@@ -314,35 +483,223 @@ def _sev_at(markers: List[Tuple[int, str]], pos: int) -> str:
     return sev
 
 
-def _parse_nvos_fnm(node: SwitchNode, section: str) -> None:
-    region = _slice(section, r"^### Other FabricManager Log Highlights",
-                    (r"^## ",))
+# -- Fabric Manager rows outside every port-state group ----------------------
+
+_FM_OUTSIDE_SUMMARIES = (
+    ("Fabric Manager log before earliest NVLSM event", "before earliest NVLSM event"),
+    ("Fabric Manager log after earliest NVLSM event", "outside port-state groups"),
+)
+
+
+def _parse_nvos_fm_outside(node: SwitchNode, region: str, gap_s: int) -> None:
+    """Cluster the FM rows the nvos report keeps *outside* the port-state groups.
+
+    These two tables are where a Fabric-Manager NVLink error lands when NVLSM
+    logged no matching port transition — exactly the case the port-state-only
+    correlation used to miss.
+    """
     if not region:
         return
-    # FNM port loss table: | FM Time | GUID | port | in_nvlsm | host | Down |
-    #                       Recovered? | Recovered Time | line num |
-    for m in re.finditer(
-        r"^\|\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\|\s*`?([^|`]+?)`?\s*\|"
-        r"\s*(\d+)\s*\|\s*([A-Za-z-]+)\s*\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|"
-        r"(?:\s*([A-Za-z-]*)\s*\|\s*([^|]*?)\s*\|)?",
-        region, re.M,
-    ):
-        ts = T.parse_full(m.group(1))
+    for needle, bucket in _FM_OUTSIDE_SUMMARIES:
+        pos = _summary_pos(region, needle)
+        if pos < 0:
+            continue
+        headers, rows = _read_table(region, pos)
+        if not headers or not rows:
+            continue
+        ti = headers.index("Time") if "Time" in headers else 0
+        ci = headers.index("Category") if "Category" in headers else -1
+        stamped: List[Tuple[datetime, List[str]]] = []
+        for cv in rows:
+            ts = T.parse_full(cv[ti] if ti < len(cv) else "")
+            if ts:
+                stamped.append((ts, cv))
+        for group in _cluster(stamped, gap_s):
+            times = [ts for ts, _ in group]
+            cats: Dict[str, int] = {}
+            for _ts, cv in group:
+                cat = (cv[ci] if 0 <= ci < len(cv) else "") or "-"
+                cats[cat] = cats.get(cat, 0) + 1
+            fm_rows, total = _dedupe_rows(cv for _ts, cv in group)
+            breakdown = ", ".join(f"{c} x{n}" for c, n in
+                                  sorted(cats.items(), key=lambda kv: -kv[1]))
+            node.events.append(_mk(
+                node, kind="fm_outside", start=times[0], end=times[-1],
+                label=f"FM log {bucket} ({total} row(s))",
+                detail=breakdown,
+                ref=f"nvos FM log {bucket} @ {T.fmt(times[0])}",
+                extra={"severity": worst_severity(cats),
+                       "bucket": bucket, "categories": cats,
+                       "fm_header": headers, "fm_rows": fm_rows, "fm_total": total,
+                       "anchor_list": _anchor_list(times)},
+            ))
+
+
+# -- NVLSM health checks -----------------------------------------------------
+
+def _parse_nvos_health(node: SwitchNode, region: str) -> None:
+    """The ``| Check | Count | Earliest | Latest |`` table.
+
+    Only earliest/latest are published, so the event carries exactly those two
+    anchors — enough to flag an Xid landing on the first or last occurrence.
+    """
+    if not region:
+        return
+    headers, rows = _read_table(region, 0)
+    if not headers or headers[:2] != ["Check", "Count"]:
+        return
+    for cv in rows:
+        row = {h: (cv[i] if i < len(cv) else "") for i, h in enumerate(headers)}
+        try:
+            count = int(_val(row, "Count") or "0")
+        except ValueError:
+            count = 0
+        start = T.parse_full(_val(row, "Earliest"))
+        if count <= 0 or not start:
+            continue
+        end = T.parse_full(_val(row, "Latest")) or start
+        check = _val(row, "Check") or "NVLSM check"
+        node.events.append(_mk(
+            node, kind="nvlsm_health", start=start, end=end,
+            label=f"{check}: {count} occurrence(s)",
+            detail=f"earliest {T.fmt(start)}, latest {T.fmt(end)}",
+            ref=f"nvos NVLSM health / {check}",
+            extra={"severity": "nvlsm_check", "check": check, "count": count},
+        ))
+
+
+# -- FNM port loss (three tables) --------------------------------------------
+
+def _parse_nvos_fnm(node: SwitchNode, region: str) -> None:
+    if not region:
+        return
+
+    for row in _table_under(region, "Fabricmanager logs which report FNM port loss events"):
+        ts = T.parse_full(_val(row, "FM Time"))
         if not ts:
             continue
-        guid, port, in_nvlsm, host, down = (m.group(2).strip(), m.group(3),
-                                            m.group(4), m.group(5).strip(), m.group(6).strip())
-        recovered = (m.group(8) or "").strip()
-        node.fnm_events.append(Event(
-            source_kind="switch", source_id=node.hostname or node.title[:24],
-            chassis=node.chassis, kind="fnm_port_loss", start=ts, end=ts,
+        port = _val(row, "port num") or "-"
+        guid = _val(row, "node GUID") or "-"
+        host = _val(row, "NVOS hostname")
+        down = _val(row, "Down Details")
+        recovered = _val(row, "Recovered Time")
+        node.events.append(_mk(
+            node, kind="fnm_port_loss", start=ts, end=ts,
             label=f"FNM port {port} loss ({down or '-'})",
             detail=f"node GUID {guid}; peer host {host or '-'}",
             ref="Other FM Highlights / FNM port loss",
-            extra={"port": port, "peer_host": host, "guid": guid,
-                   "down": down, "recovered": recovered},
+            extra={"severity": "port_loss", "port": port, "peer_host": host,
+                   "guid": guid, "down": down, "recovered": recovered,
+                   "line": _val(row, "related log line number")},
         ))
 
+    _parse_fnm_nvlsm_table(
+        node, region, "Unmatched nvlsm loss", "fnm_nvlsm_unmatched")
+    _parse_fnm_nvlsm_table(
+        node, region, "nvlsm logs which can not linked to FM FNM port loss event",
+        "fnm_nvlsm_recovery")
+
+
+def _parse_fnm_nvlsm_table(node: SwitchNode, region: str, needle: str,
+                           kind: str) -> None:
+    for row in _table_under(region, needle):
+        ts = T.parse_full(_val(row, "Time"))
+        if not ts:
+            continue
+        port = _val(row, "port") or "-"
+        name = _val(row, "port name")
+        guid = _val(row, "Switch GUID") or "-"
+        host = _val(row, "NVOS hostname")
+        transition = _val(row, "transition") or "-"
+        reason = _val(row, "reason")
+        node.events.append(_mk(
+            node, kind=kind, start=ts, end=ts,
+            label=f"FNM port {port}{f' ({name})' if name else ''} {transition}",
+            detail=f"switch GUID {guid}; host {host or '-'}"
+                   + (f"; {reason}" if reason else ""),
+            ref=f"Other FM Highlights / {needle}",
+            extra={"severity": "port_loss", "port": port, "port_name": name,
+                   "guid": guid, "peer_host": host, "down": transition,
+                   "recovered": "", "reason": reason,
+                   "line": _val(row, "nvlsm line", "related log line number")},
+        ))
+
+
+# -- raw Fabric-Manager highlight blocks -------------------------------------
+
+_RAW_BLOCKS = (
+    ("Failed to get switch info", "switch_info_failure", "switch_info_failed"),
+    ("Partition unexpected error state", "partition_error", "partition_error"),
+    ("Multicast team limit reached", "multicast_limit", "multicast_limit"),
+)
+
+_RAW_TS_RE = re.compile(r"^\[([A-Z][a-z]{2} \d{1,2} \d{4} \d{2}:\d{2}:\d{2})\]")
+
+
+def _parse_nvos_raw_blocks(node: SwitchNode, region: str, gap_s: int) -> None:
+    """Cluster the ``[Mon DD YYYY HH:MM:SS] …`` raw FM highlight blocks."""
+    if not region:
+        return
+    for heading, kind, severity in _RAW_BLOCKS:
+        block = _slice(region, r"^#### " + re.escape(heading), (r"^#### ", r"^### "))
+        if not block:
+            continue
+        stamped: List[Tuple[datetime, str]] = []
+        for line in _fenced_lines(block):
+            m = _RAW_TS_RE.match(line.strip())
+            if not m:
+                continue
+            ts = T.parse_bracket(m.group(1))
+            if ts:
+                stamped.append((ts, line.strip()))
+        for group in _cluster(stamped, gap_s):
+            times = [ts for ts, _ in group]
+            lines = [ln for _ts, ln in group]
+            node.events.append(_mk(
+                node, kind=kind, start=times[0], end=times[-1],
+                label=f"{heading} ({len(lines)} line(s))",
+                detail=_first_distinct(lines),
+                ref=f"Other FM Highlights / {heading} @ {T.fmt(times[0])}",
+                extra={"severity": severity, "topic": heading, "lines": lines,
+                       "anchor_list": _anchor_list(times)},
+            ))
+
+
+def _first_distinct(lines: List[str], limit: int = 2) -> str:
+    """Short digest of a raw block: the first ``limit`` distinct message bodies."""
+    seen: List[str] = []
+    for ln in lines:
+        body = _RAW_TS_RE.sub("", ln).strip()
+        body = re.sub(r"^\[[A-Z]+\]\s*\[tid \d+\]\s*", "", body)
+        body = re.sub(r"\b0x[0-9a-fA-F]+\b", "0x…", body)
+        if body and body not in seen:
+            seen.append(body)
+        if len(seen) >= limit:
+            break
+    return "; ".join(seen)
+
+
+# -- Fabric Manager lifecycle ------------------------------------------------
+
+def _parse_nvos_lifecycle(node: SwitchNode, region: str) -> None:
+    for row in _table_under(region, "FM lifecycle events"):
+        ts = T.parse_full(_val(row, "Time"))
+        if not ts:
+            continue
+        etype = (_val(row, "Type") or "?").replace("**", "").strip()
+        node.events.append(_mk(
+            node, kind="fm_lifecycle", start=ts, end=ts,
+            label=f"Fabric Manager {etype}",
+            detail=_val(row, "Message"),
+            ref="Other FM Highlights / FM lifecycle",
+            extra={"severity": "lifecycle", "type": etype,
+                   "message": _val(row, "Message")},
+        ))
+
+
+# ---------------------------------------------------------------------------
+# nv-bug-report cross-node comparison report
+# ---------------------------------------------------------------------------
 
 _XREF_GRP_RE = re.compile(
     r"Event Group (\d+):\s*"
@@ -390,7 +747,7 @@ def _distinct_xids(block: str) -> List[Tuple[str, str, str, str, List[str]]]:
         s = line.strip()
         if not s.startswith("|"):
             continue
-        cells = [c.strip() for c in s.strip("|").split("|")]
+        cells = _cells(s)
         if len(cells) < 5:
             continue
         host = cells[1].strip("` ")
@@ -421,7 +778,7 @@ def _suppressed_rows(block: str) -> List[Tuple[str, str]]:
         s = line.strip()
         if not s.startswith("|") or "suppressed" not in s:
             continue
-        cells = [c.strip() for c in s.strip("|").split("|")]
+        cells = _cells(s)
         if len(cells) < 5:
             continue
         m = _SUPPRESS_RE.search(cells[4])
@@ -465,7 +822,7 @@ def parse_nvbug_cross(path: str, text: str) -> CrossNodeReport:
     return rep
 
 
-def parse_report(path: str):
+def parse_report(path: str, cluster_gap_s: int = DEFAULT_CLUSTER_GAP_S):
     """Parse one report file; return ('nvbug', TrayReport) / ('nvos', SwitchReport)
     / ('nvbug_cross', CrossNodeReport) / (None, None)."""
     with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -476,5 +833,5 @@ def parse_report(path: str):
     if kind == "nvbug_cross":
         return kind, parse_nvbug_cross(path, text)
     if kind == "nvos":
-        return kind, parse_nvos(path, text)
+        return kind, parse_nvos(path, text, cluster_gap_s)
     return None, None

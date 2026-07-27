@@ -1,28 +1,51 @@
 """Correlation engine: line up compute-tray and switch events in time.
 
 Compute-tray events (Xid / IMEX) come from nv-bug-report reports; switch events
-(port-state / FNM port loss) come from NVOS dump reports. Both are local
-wall-clock with no timezone marker, so a minute ``offset`` is applied to the
-switch side before comparing.
+come from **every** time-stamped section of the NVOS dump report (port-state
+groups, Fabric-Manager rows outside those groups, FNM port loss, switch-info /
+partition / multicast failures, FM lifecycle, NVLSM health). Both sides are
+local wall-clock with no timezone marker, so a minute ``offset`` is applied to
+the switch side before comparing.
 
 Matching is by **anchor proximity**, not interval overlap: each event is reduced
-to its discrete anchor moments — its ``start`` and (if different) its ``end``.
-This matters because a port-state group can lump an ACTIVE→DOWN and its recovery
-tens of days apart into one group; treating that whole span as "active" would
-spuriously match everything in between. Two events correlate when any anchor of
-one is within ``window_s`` of any anchor of the other (after the offset).
-``suggest_offsets`` sweeps candidate offsets and scores each by anchor hits so
-the user can pick the right timezone delta.
+to discrete anchor moments — its ``start`` and (if different) its ``end``, or the
+explicit ``extra['anchor_list']`` a clustered source carries. This matters
+because a port-state group can lump an ACTIVE→DOWN and its recovery tens of days
+apart into one group; treating that whole span as "active" would spuriously match
+everything in between. Two events correlate when any anchor of one is within
+``window_s`` of any anchor of the other (after the offset). ``suggest_offsets``
+sweeps candidate offsets and scores each by anchor hits so the user can pick the
+right timezone delta.
 """
 
 from __future__ import annotations
 
 import bisect
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
 from .models import Event, SwitchReport, TrayReport
+
+# Naive datetimes are compared through this fixed epoch rather than
+# ``datetime.timestamp()`` so a DST boundary in the host's local zone can never
+# shift one side by an hour.
+_EPOCH = datetime(1970, 1, 1)
+
+
+def _ts(dt: datetime) -> float:
+    return (dt - _EPOCH).total_seconds()
+
+
+@dataclass
+class Hit:
+    """One compute↔switch anchor match, keeping the moments that matched."""
+
+    compute: Event
+    switch: Event
+    delta_s: int
+    switch_anchor: datetime   # raw switch clock (offset NOT applied)
+    compute_anchor: datetime  # compute-tray clock
 
 
 @dataclass
@@ -42,10 +65,20 @@ class Result:
     total_compute: int
     chassis_scoped: bool
     suggestions: List[Tuple[int, int]]  # (offset_min, anchor_hits), best first
+    hits: List[Hit] = field(default_factory=list)      # every anchor match
+    switch_events: List[Event] = field(default_factory=list)  # all switch events, sorted
 
 
 def anchors(e: Event) -> List[datetime]:
-    """Discrete moments an event represents: its start, and its end if distinct."""
+    """Discrete moments an event represents.
+
+    A clustered source (Fabric-Manager burst, raw-log block) publishes every
+    distinct moment it contains via ``extra['anchor_list']``; everything else
+    falls back to its start and, if different, its end.
+    """
+    explicit = e.extra.get("anchor_list")
+    if explicit:
+        return explicit
     if e.end and e.end != e.start:
         return [e.start, e.end]
     return [e.start]
@@ -59,18 +92,6 @@ def _same_chassis(a: Event, b: Event, scoped: bool) -> bool:
     return True  # unknown chassis on either side -> don't exclude
 
 
-def _min_delta_s(ce: Event, se: Event, off: timedelta) -> Optional[int]:
-    """Smallest |Δ| in seconds between any compute anchor and any (shifted) switch
-    anchor."""
-    best: Optional[float] = None
-    for ca in anchors(ce):
-        for sa in anchors(se):
-            d = abs((ca - (sa + off)).total_seconds())
-            if best is None or d < best:
-                best = d
-    return int(best) if best is not None else None
-
-
 def gather_compute(trays: List[TrayReport]) -> List[Event]:
     out: List[Event] = []
     for t in trays:
@@ -79,10 +100,14 @@ def gather_compute(trays: List[TrayReport]) -> List[Event]:
     return out
 
 
-def gather_switch(switches: List[SwitchReport]) -> List[Event]:
+def gather_switch(switches: List[SwitchReport],
+                  exclude_kinds: Optional[set] = None) -> List[Event]:
     out: List[Event] = []
     for s in switches:
-        out.extend(s.all_events())
+        for e in s.all_events():
+            if exclude_kinds and e.kind in exclude_kinds:
+                continue
+            out.append(e)
     out.sort(key=lambda e: e.start)
     return out
 
@@ -101,8 +126,8 @@ def suggest_offsets(compute: List[Event], switch: List[Event], window_s: int,
         grid_minutes = sorted(s)
 
     tol = window_s
-    c_anch = sorted(a.timestamp() for e in compute for a in anchors(e))
-    s_anch = [a.timestamp() for e in switch for a in anchors(e)]
+    c_anch = sorted(_ts(a) for e in compute for a in anchors(e))
+    s_anch = [_ts(a) for e in switch for a in anchors(e)]
     scored: List[Tuple[int, int]] = []
     for off in grid_minutes:
         off_s = off * 60
@@ -118,35 +143,67 @@ def suggest_offsets(compute: List[Event], switch: List[Event], window_s: int,
 
 
 def correlate(trays: List[TrayReport], switches: List[SwitchReport],
-              offset_min: int, window_s: int, scoped: bool = True) -> Result:
+              offset_min: int, window_s: int, scoped: bool = True,
+              exclude_kinds: Optional[set] = None) -> Result:
+    """Match every switch anchor against the sorted compute anchor index.
+
+    Indexing the compute side and binary-searching it keeps the pass linear in
+    the number of switch anchors — the switch side now contributes thousands of
+    them (every Fabric-Manager row outside a port-state group), so the previous
+    all-pairs scan would have been quadratic.
+    """
     compute = gather_compute(trays)
-    switch = gather_switch(switches)
-    off = timedelta(minutes=offset_min)
+    switch = gather_switch(switches, exclude_kinds)
+    off_s = offset_min * 60
+
+    # Sorted (anchor_epoch, compute_index, anchor_datetime) index.
+    c_index: List[Tuple[float, int, datetime]] = sorted(
+        (_ts(a), i, a) for i, e in enumerate(compute) for a in anchors(e))
+    c_ts = [row[0] for row in c_index]
+
+    # (compute_idx, switch_idx) -> best Hit so far
+    best: Dict[Tuple[int, int], Hit] = {}
+    for si, se in enumerate(switch):
+        for sa in anchors(se):
+            t = _ts(sa) + off_s
+            lo = bisect.bisect_left(c_ts, t - window_s)
+            hi = bisect.bisect_right(c_ts, t + window_s)
+            for k in range(lo, hi):
+                cts, ci, ca = c_index[k]
+                ce = compute[ci]
+                if not _same_chassis(ce, se, scoped):
+                    continue
+                d = int(abs(cts - t))
+                key = (ci, si)
+                prev = best.get(key)
+                if prev is None or d < prev.delta_s:
+                    best[key] = Hit(compute=ce, switch=se, delta_s=d,
+                                    switch_anchor=sa, compute_anchor=ca)
+
+    hits = sorted(best.values(), key=lambda h: (h.switch_anchor, h.delta_s))
+
+    by_compute: Dict[int, List[Tuple[Event, int]]] = {}
+    matched_switch_ids = set()
+    for (ci, _si), h in best.items():
+        by_compute.setdefault(ci, []).append((h.switch, h.delta_s))
+        matched_switch_ids.add(id(h.switch))
 
     correlations: List[Correlation] = []
     unmatched_compute: List[Event] = []
-    matched_ids = set()
-
-    for ce in compute:
-        hits: List[Tuple[Event, int]] = []
-        for se in switch:
-            if not _same_chassis(ce, se, scoped):
-                continue
-            d = _min_delta_s(ce, se, off)
-            if d is not None and d <= window_s:
-                hits.append((se, d))
-                matched_ids.add(id(se))
-        if hits:
-            hits.sort(key=lambda x: x[1])
-            correlations.append(Correlation(compute=ce, switches=hits))
+    for ci, ce in enumerate(compute):
+        rows = by_compute.get(ci)
+        if rows:
+            rows.sort(key=lambda x: x[1])
+            correlations.append(Correlation(compute=ce, switches=rows))
         else:
             unmatched_compute.append(ce)
 
-    matched_switch = [e for e in switch if id(e) in matched_ids]
+    matched_switch = [e for e in switch if id(e) in matched_switch_ids]
     suggestions = suggest_offsets(compute, switch, window_s, scoped)
     return Result(
         offset_min=offset_min, window_s=window_s, correlations=correlations,
         unmatched_compute=unmatched_compute, matched_switch=matched_switch,
         total_switch=len(switch), total_compute=len(compute),
         chassis_scoped=scoped, suggestions=suggestions,
+        hits=hits, switch_events=switch,
     )

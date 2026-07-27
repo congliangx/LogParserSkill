@@ -4,3 +4,41 @@ __pycache__/
 # Per-skill uv virtual environments — built in place via `uv sync` at the
 # install location; a .venv is not path-portable, so it is never committed.
 .venv/
+
+# Developer environment config that lands in the working tree (the agent
+# sandbox surfaces these at the repo root as /dev/null mounts). None of it
+# describes the skills, so none of it belongs in the repo.
+
+# Shell
+.bashrc
+.bash_profile
+.profile
+.zshrc
+.zprofile
+
+# Per-user tool config
+.gitconfig
+.ripgreprc
+
+# Editors / IDEs (no trailing slash — the sandbox surfaces these as files)
+.idea
+.vscode
+
+# Claude Code workspace config. Listed entry by entry rather than as a blanket
+# `.claude/` so genuinely shared project config can still be committed later.
+.claude/agents
+.claude/commands
+.claude/hooks
+.claude/skills
+.claude/workflows
+.claude/routines
+.claude/output-styles
+.claude/launch.json
+.claude/loop.md
+.claude/scheduled_tasks.json
+.claude/settings.json
+.mcp.json
+
+# Remove this line before running `git submodule add` — git writes .gitmodules
+# itself and it must be tracked for submodules to resolve for anyone else.
+.gitmodules

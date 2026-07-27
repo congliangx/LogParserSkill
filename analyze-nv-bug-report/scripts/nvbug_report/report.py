@@ -2,7 +2,7 @@
 
 import os
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
 from nvbug_report.constants import C2C_GPU_KEYWORDS
@@ -809,11 +809,21 @@ def generate_report(filepath, sys_info, lspci_gpus, lspci_detail, smi_gpus, xids
         if non_conn:
             has_imex_conn_issue = True
             r.append("**Non-Connected Node Pairs**:\n")
+            # A degraded domain can flood this table (near-full N x N matrix); fold it
+            collapse = len(non_conn) > 20
+            if collapse:
+                status_counts = Counter(st for _, _, st in non_conn)
+                breakdown = ", ".join(f"{n} × {st}" for st, n in status_counts.most_common())
+                r.append(f"<details><summary>{len(non_conn)} non-connected pairs ({breakdown})</summary>")
+                r.append("")
             r.append("| From | To | Status |")
             r.append("|------|-----|--------|")
             for fr, to, st in non_conn:
                 r.append(f"| {fr} | {to} | {st} |")
             r.append("")
+            if collapse:
+                r.append("</details>")
+                r.append("")
         elif nodes:
             r.append("All node interconnections normal (all Connected).\n")
 

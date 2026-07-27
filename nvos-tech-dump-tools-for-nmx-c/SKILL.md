@@ -118,5 +118,5 @@ Edit these only to retune grouping; the defaults mirror `nvos_parser` FM `-vvv` 
 ## Notes
 
 - The tool extracts only the `log/nmx` subtree from a tarball into a temp directory and removes it on exit — it never unpacks the full dump.
-- The HTML report embeds its own CSS/JS (no CDN, opens offline) and is the recommended viewer for the wide aggregated tables.
+- The HTML report embeds its own CSS/JS (no CDN, opens offline) and is the recommended viewer for the wide aggregated tables. It shares the correlation-xid instrument-panel styling: a sticky sidebar TOC with scroll-spy, sortable/filterable tables, expand/collapse-all, mono-set machine data, and **severity rails** on `<details>` — fatal (Xid / nvl_fatal) event groups and suspect hardware-swap slots get a red rail, nvl_non_fatal groups an amber one — so fatal fabric faults are visible at a glance in both the body and the sidebar. Light/dark auto, keyboard focus and reduced-motion respected. The Markdown report is unchanged.
 - Platform: Linux and macOS. Python **3.9+**, standard library only (no third-party dependencies).

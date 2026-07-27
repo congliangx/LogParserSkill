@@ -7,7 +7,7 @@ one place instead of being maintained twice.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ..analyze.pipeline import NodeAnalysis
 from .aggregates import (
@@ -143,7 +143,7 @@ def _append_slot_block(r: Renderer, group: SlotMappingGroup) -> None:
         summary_inner = "🚨 " + r.i_red(
             f"{summary} — suspect hardware change", bold=True
         )
-        r.open_details(summary_inner, default_open=True)
+        r.open_details(summary_inner, default_open=True, severity="fatal")
     else:
         r.open_details(r.i_text(summary))
     if group.rows:
@@ -174,7 +174,7 @@ def _append_gpu_mappings(r: Renderer, racks: List[RackMappingGroup]) -> None:
     for rack in racks:
         summary = f"rack GUID {rack.rack_guid}"
         if _rack_is_anomalous(rack):
-            r.open_details(r.i_red(summary, bold=True))
+            r.open_details(r.i_red(summary, bold=True), severity="fatal")
         else:
             r.open_details(r.i_text(summary))
         for sg in rack.slot_groups:
@@ -325,10 +325,19 @@ def _append_fm_fnm_port_loss(r: Renderer, report: FnmPortLossReport) -> None:
 # -----------------------------------------------------------------------------
 
 
-def _render_event_group(r: Renderer, idx: int, cl: Dict[str, Any]) -> None:
+def _render_event_group(
+    r: Renderer, idx: int, cl: Dict[str, Any], *, severity: Optional[str] = None
+) -> None:
     fm_rows = cl.get("fm_event_rows") or []
+    is_fatal = rows_have_nvl_fatal(fm_rows)
     summary_text = f"Event group {idx}: {cl['start']} – {cl['end']}"
-    r.open_details(r.i_text(summary_text), red=rows_have_nvl_fatal(fm_rows))
+    # Fatal groups get the red rail (via red=); non-fatal groups get the amber
+    # rail passed down from their section wrapper.
+    r.open_details(
+        r.i_text(summary_text),
+        red=is_fatal,
+        severity=(None if is_fatal else severity),
+    )
     # Unified summary: surfaces both the switch/port count (HTML's choice) and
     # the unique-transition-pattern count (Markdown's choice). Either alone
     # under-described the event group.
@@ -408,10 +417,11 @@ def _render_event_group_section(r: Renderer, ctx: Dict[str, Any]) -> None:
 
     if non_fatal_pairs:
         r.open_details(
-            r.i_bold("Event groups with Xid (nvl_non_fatal) events")
+            r.i_bold("Event groups with Xid (nvl_non_fatal) events"),
+            severity="warn",
         )
         for idx, cl in non_fatal_pairs:
-            _render_event_group(r, idx, cl)
+            _render_event_group(r, idx, cl, severity="warn")
         r.close_details()
 
     if normal_pairs:
@@ -459,7 +469,14 @@ def _render_fm_log_before_after_event_groups(
 
 def render_node(r: Renderer, node: NodeAnalysis, ctx: Dict[str, Any]) -> None:
     """Append a full ``NodeAnalysis`` section to ``r``."""
-    r.heading(2, ctx.get("node_title") or f"Node: {ctx['label']}")
+    node_title = ctx.get("node_title") or f"Node: {ctx['label']}"
+    # Sidebar label: just the hostname. The title is
+    # "<chassis>-Slot N: <hostname> - eth0 / eth1"; drop the " - <ips>" tail,
+    # then the "<chassis>-Slot N: " prefix, leaving "<hostname>". Hostnames
+    # carry no " - " or ": ", so the splits are safe; the in-body heading and
+    # the sidebar hover title both keep the full identity.
+    nav_label = node_title.split(" - ", 1)[0].rsplit(": ", 1)[-1]
+    r.heading(2, node_title, nav_label=nav_label)
     summary_bullets: List[str] = []
     earliest = ctx.get("earliest_nvlsm_ts") or ""
     if earliest:
@@ -477,7 +494,7 @@ def render_node(r: Renderer, node: NodeAnalysis, ctx: Dict[str, Any]) -> None:
         f"Fabric Manager: events: {r.i_bold(f'{len(node.fm_events):,}')} | "
         f"files: {r.i_bold(str(node.fm_files_parsed))}"
     )
-    r.bullets(summary_bullets)
+    r.bullets(summary_bullets, css_class="node-stats")
 
     r.heading(3, "NVLSM & FM log checks for Compute Trays")
     h = node.nvlsm_health
