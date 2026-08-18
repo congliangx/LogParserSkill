@@ -1,6 +1,6 @@
 ---
 name: analyze-nv-bug-report
-description: Analyze NVIDIA nv-bug-report log files, extracting GPU status from lspci, nvidia-smi, dmesg/messages. Used for troubleshooting GPU hardware failures, PCIe link degradation, ECC errors, Xid errors, etc. Use this skill when user provides an nv-bug-report.log or .log.gz file and asks for analysis.
+description: Analyze NVIDIA nv-bug-report log files, extracting GPU status from lspci, nvidia-smi, dmesg/messages and producing a mandatory AI-synthesized diagnosis and recommendations in the report summary. Used for troubleshooting GPU hardware failures, PCIe link degradation, ECC errors, Xid errors, etc. Use this skill when user provides an nv-bug-report.log or .log.gz file and asks for analysis.
 ---
 
 # Analyze NVIDIA Bug Report Logs
@@ -59,7 +59,7 @@ Use the bundled analysis script for automated extraction. The script automatical
 - Detects derivative Xid entries via two mechanisms: (a) NVRM lines explicitly tagged `caused by previous Xid N`, and (b) **time-inferred**: bare Xid 45 lines emitted within 10s of a primary Xid 145/149 on the same BDF (NVRM driver intermittently drops the textual annotation on later cleanup channels in the same burst). Each xid dict gets `is_derivative` / `caused_by`, with an extra `derivative_inferred=True` flag for the inferred variant so 7.1 can call out the inferred count. Section 7.1 splits Primary vs Derivative counts (and footnotes the inferred subtotal); section 7.2 decodes **every** Xid type (primary and derivative both feed the analyzer so the table reflects all observed mnemonics; downstream `(decoded_xid, mnemonic, resolution)` dedup keeps it compact regardless of how many derivative lines were processed); section 7.3 collapses each `(xid, caused_by)` derivative group to a single representative line per burst with a `# +N more ... suppressed` annotation, so a single Xid 145 + dozens of Xid 45 channel cleanups no longer floods the report
 - Parses `/var/log/nvidia-imex.log` for "Node disconnect event detected" ERROR entries only (WARNING and other ERROR types are filtered out), groups them into timeline **event groups**, and intelligently deduplicates repetitive messages
 - Correlates IMEX disconnect event groups with Xid bursts by time overlap (+/- 60s) for causal analysis, showing related IMEX **event group numbers** in each Xid Raw Log event group and **interleaving IMEX log lines into the raw log block**
-- Generates a complete Markdown report and saves it to the log directory
+- Generates the deterministic baseline Markdown report and saves it to the log directory; the report is not complete until the mandatory AI pass in Step 2.7 is finished
 
 ```bash
 <SKILL_ROOT>/.venv/bin/python <SKILL_ROOT>/scripts/analyze.py <file>.log
@@ -80,9 +80,9 @@ Report file is named `<original-filename>-analysis-report.md`, saved in the `rep
 
 Open with `open <name>.html` (macOS) / `xdg-open <name>.html` (Linux).
 
-The HTML sidecar requires the `markdown` PyPI package (already bundled in the skill's `uv` environment — see the install-paths note above). If `markdown` is missing or HTML rendering fails for any reason, a `[warn]` line is printed to stderr and the `.md` report is still written normally — HTML failure never blocks the markdown output.
+The HTML sidecar requires the `markdown` PyPI package (already bundled in the skill's `uv` environment — see the install-paths note above). If `markdown` is missing or HTML rendering fails for any reason, a `[warn]` line is printed to stderr and the `.md` report is still written normally — HTML failure never blocks the markdown output. If a post-edit re-render fails, warn the user and deliver/link only the current Markdown; do not present the stale HTML as current.
 
-**Re-rendering after you edit a `.md` (IMPORTANT):** `analyze.py` renders each `.html` once, from the report as it stands at generation time. Whenever you edit a `.md` afterward — appending the cross-node `### 6.1 Analysis Summary` (Step 2.6) or a `NVBugs Related Bugs` section (Step 2.5) — its `.html` becomes stale. Re-render it with the bundled renderer (the **same** code `analyze.py` uses), so the HTML always matches the `.md`. **Do NOT hand-roll HTML, regenerate it with any other tool, or write your own HTML — always use this command:**
+**Re-rendering after you edit a `.md` (IMPORTANT):** `analyze.py` renders each `.html` once, from the report as it stands at generation time. Whenever you edit a `.md` afterward — adding the mandatory Section 8 AI analysis (Step 2.7), the cross-node `### 6.1 Analysis Summary` (Step 2.6), or a `NVBugs Related Bugs` section (Step 2.5) — its `.html` becomes stale. Re-render it with the bundled renderer (the **same** code `analyze.py` uses), so the HTML always matches the `.md`. **Do NOT hand-roll HTML, regenerate it with any other tool, or write your own HTML — always use this command:**
 
 ```bash
 <SKILL_ROOT>/.venv/bin/python <SKILL_ROOT>/scripts/nvbug_report/html_renderer.py <report.md> [more.md ...]
@@ -131,21 +131,22 @@ Run this step only when the user's request explicitly opts in to NVBugs lookup (
 
    When this happens, abort the entire NVBugs subsection (do not retry per Xid type), and tell the user once in chat ("NVBugs MCP unavailable, skipping NVBugs search.").
 
-2. **No Xid errors** — section 7.2 (Xid Detailed Decode) of the per-node report (or its equivalent in the cross-node report) contains zero decoded Xid entries. Silently skip; do not mention in chat.
+2. **No Xid evidence** — both Section 7.1 and the Xid raw-log section contain zero Xid entries. A missing/failed decoder or an empty Section 7.2 is not evidence that no Xids exist. Silently skip only when the extracted report itself contains none; do not mention in chat.
 
 Otherwise, after report generation use MaaS NVBugs MCP to search related bugs and append to the report.
 
 **Procedure:**
 
-1. Extract the deduplicated Xid type list (Xid number + mnemonic) from report section 7.2 (Xid Detailed Decode)
-2. Get the GPU model (e.g. GB200) from report section 2
+1. Extract the deduplicated Xid type list from Section 7.2 when available; otherwise fall back to Section 7.1 plus raw Xid text and mark an unavailable mnemonic as unknown
+2. Get the GPU model (e.g. GB200) from each single-node report's Section 2; in batch mode build distinct `(GPU model, Xid type)` pairs instead of assuming one model for every node
 3. For each unique Xid type, call the `nvbugs_search` MCP tool for semantic search:
    - server: `user-MaaS NVBugs`
    - toolName: `nvbugs_search`
    - arguments: `{ "query": "GPU Xid {number} {mnemonic} on {gpu_model}", "search_type": "semantic", "max_results": 5 }`
 4. Skip Xid 45 (preemptive cleanup, typically triggered by other Xid, not an independent issue)
 5. Extract bug ID, title, severity, disposition from search results
-6. Append results to the end of the report file as the next sequential section (e.g. "9. NVBugs Related Bugs" for single-node reports, "7. NVBugs Related Bugs" for comparison reports — use the next number after the last existing section)
+6. For the 1-3 candidates most consistent with the observed GPU model, Xid subtype, event sequence, workload, and driver/RM context, retrieve the available bug details (description, analysis/root cause, affected/fixed builds, resolution, and relevant comments) with a read-only NVBugs detail tool. If no detail tool is available, retain the synopsis-only evidence and label it as such in Step 2.7; never promote a title-only match to a confirmed root cause.
+7. Append results to the end of the report file as the next sequential section (e.g. "9. NVBugs Related Bugs" for single-node reports, "7. NVBugs Related Bugs" for comparison reports — use the next number after the last existing section)
 
 **Example search queries:**
 - `"GPU Xid 145 NVLINK_RLW_ERROR on GB200"`
@@ -186,9 +187,9 @@ Markdown formatting requirements for the collapsible block:
 - Keep one blank line after `</summary>` before markdown content
 - Keep blank lines before and after each markdown table
 
-**Batch mode:** Append once to the comparison report (`cross-node-report.md`); all nodes share the same Xid type search results.
+**Batch mode:** Append once to `cross-node-report.md`, grouping results by GPU model and Xid type (for example, `### GB200 — Xid 145 (...)`). Retain the per-node mapping for Step 2.7; do not apply a candidate from one model to another unless its returned evidence explicitly supports both.
 
-**After appending the NVBugs section, re-render the edited report's `.html`** so the sidecar reflects it — run `scripts/nvbug_report/html_renderer.py <report.md>` on each `.md` you appended to (the single-node report, or `cross-node-report.md` in batch mode; see "Re-rendering after you edit a `.md`" in Step 2). Do not write the HTML yourself.
+After appending the NVBugs section, retain the search and detail evidence for Step 2.7. Defer HTML rendering until all agent edits are complete, then re-render every modified `.md` once with the bundled renderer.
 
 ### Step 2.6: dmesg / messages Analysis
 
@@ -204,13 +205,13 @@ For single-node reports, section 7.5 is auto-generated — no agent action neede
 
 For comparison reports (batch mode), append the cross-node dmesg/messages analysis **into Section 6 (Cross-Node Comparison Summary)** as subsections, directly after the auto-generated Xid comparison content (common/unique Xid, IMEX-Xid correlation). Do NOT create a separate top-level section.
 
-1. Read each single-node report's section 7.5 highlights
+1. Read each complete single-node report; use Sections 1-7.4/7.6 for GPU/fabric evidence and Section 7.5 for non-GPU system evidence
 2. Append a single `### 6.1 Analysis Summary` subsection under section 6. It MUST start with an LLM-generated disclaimer note and wrap its content in a collapsible `<details>` block. Group findings by theme (omit a theme if no relevant data) — do NOT split into separate "Issue Summary" and "System-Level Analysis" subsections:
 
 ```markdown
 ### 6.1 Analysis Summary
 
-> **Note**: This subsection is generated by the LLM agent by reading each node's section 7.5. For reference only.
+> **Note**: This subsection is generated by the LLM agent by reading each node's report, including section 7.5. For reference only.
 
 <details>
 <summary>Click to expand Analysis Summary</summary>
@@ -233,12 +234,21 @@ Markdown formatting requirements for the collapsible blocks:
 - Keep one blank line after `</summary>` before markdown content
 - Keep one blank line before `</details>`
 
-Do NOT generate "Root Cause Hypothesis" or "Recommended Actions" subsections.
+Inside Section 6.1, do NOT generate "Root Cause Hypothesis" or "Recommended Actions" subsections; the mandatory per-node Section 8 analysis remains governed by Step 2.7.
 
 **Notes:**
 - If more context is needed (e.g. 10 lines around an error), use the Read tool to directly read the original log file
-- If a node's 7.5 section is empty or missing, skip that node
-- **After appending `### 6.1 Analysis Summary` to `cross-node-report.md`, re-render its `.html`** so the sidecar reflects the new content — run `scripts/nvbug_report/html_renderer.py cross-node-report.md` (see "Re-rendering after you edit a `.md`" in Step 2). Do not write the HTML yourself.
+- If a node's 7.5 section is empty or missing, omit only its 7.5-derived themes; do not discard its GPU/Xid evidence
+- After appending `### 6.1 Analysis Summary`, defer HTML rendering until all agent edits are complete, then re-render every modified `.md` once with the bundled renderer.
+
+### Step 2.7: Mandatory AI Deep Analysis in Section 8
+
+Treat `analyze.py`'s Critical/Warning/OK entries as the deterministic baseline, not the finished Section 8. For every single-node report, including each per-node report produced by `--batch`:
+
+1. Complete the optional NVBugs lookup first when the user requested it.
+2. Read [Section 8 AI Deep Analysis](references/section-8-ai-analysis.md) completely, then append its required `### AI Deep Analysis` block inside Section 8, after all baseline entries and before the next top-level section. Keep every baseline entry visible, but explicitly qualify or correct any unsupported health claim in the AI block. Use the user's requested language, or match the existing report language when none was specified.
+3. If NVBugs lookup succeeded, synthesize the relevant search and detail evidence into the diagnosis, confidence, and recommended actions; a result table alone is insufficient. If lookup was skipped or unavailable, follow Step 2.5 and base the analysis only on available log evidence.
+4. Re-render every modified Markdown report with `html_renderer.py`. Do not deliver a report whose Section 8 lacks this AI block. If rendering fails, deliver the Markdown with a warning and do not present the stale HTML as current.
 
 ### Step 3: Manual Analysis Guide
 
@@ -339,7 +349,7 @@ Note: The same Xid number may produce different classifications and resolutions 
 
 ### Step 5: Output Report
 
-Use the following template for report output. **Note**: All section numbers are generated dynamically by the script and are always continuous without gaps. The numbers below (1-8) are illustrative; actual numbers depend on the GPU model and available data.
+Use the following template for report output. **Note**: Top-level section numbers are generated dynamically and remain continuous; conditional 7.x subsections may be omitted and therefore leave a gap. The numbers below (1-8) are illustrative.
 
 ```markdown
 # NVIDIA Bug Report Analysis
@@ -453,14 +463,17 @@ Use the following template for report output. **Note**: All section numbers are 
 
 ## 8. Summary & Recommendations
 - 🔴 **Critical**: (if any — includes GPU initialization failure, PCIe HW failure, fallen off bus, etc.)
-- 🟡 **Warning**: (if any — includes IMEX-Xid temporal correlation analysis: when IMEX events overlap with Xid bursts within a 30s window, a correlation warning is generated showing which Xid types co-occurred)
+- 🟡 **Warning**: (if any — includes IMEX-Xid temporal correlation analysis: when IMEX events overlap with Xid bursts within a 60s window, a correlation warning is generated showing which Xid types co-occurred)
 - 🟢 **OK**: (if any)
+
+### AI Deep Analysis
+(Mandatory LLM block defined by Step 2.7; keep the deterministic entries visible and qualify unsupported health claims here.)
 
 ## 9. NVBugs Related Bugs
 (Optional; omit this section entirely by default. Append it in Step 2.5 via NVBugs MCP search only when the user explicitly requests NVBugs lookup. MUST include a "> **Note**: This section is generated by the LLM agent ... For reference only" disclaimer line directly under the section heading, and wrap all Xid subsection tables in a single collapsible `<details>` block. One subsection per Xid type with Bug ID, Title, Severity, Disposition table.)
 ```
 
-**Note on LLM-generated sections**: Section 6.1 Analysis Summary (in batch/comparison reports) and section "NVBugs Related Bugs" (when explicitly requested) are generated by the LLM agent rather than by `analyze.py`. Each MUST start with a `> **Note**: ... For reference only` disclaimer immediately under its heading, and its content MUST be wrapped in a collapsible `<details>` block (matching the style used by script-generated IMEX events and Xid Raw Logs).
+**Note on LLM-generated sections**: Section 8 `AI Deep Analysis`, Section 6.1 Analysis Summary (in batch/comparison reports), and section "NVBugs Related Bugs" (when explicitly requested) are generated by the LLM agent rather than by `analyze.py`. Each MUST start with a `> **Note**: ... For reference only` disclaimer immediately under its heading, and its content MUST be wrapped in a collapsible `<details>` block (matching the style used by script-generated IMEX events and Xid Raw Logs).
 
 ## Notes
 
