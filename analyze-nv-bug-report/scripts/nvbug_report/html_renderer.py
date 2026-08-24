@@ -391,6 +391,7 @@ _CSS = r"""
   --topbar-bg: #24292f;
   --topbar-fg: #ffffff;
   --sidebar-bg: #f6f8fa;
+  --ok-fg: #1a7f37;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -415,6 +416,7 @@ _CSS = r"""
     --topbar-bg: #161b22;
     --topbar-fg: #e6edf3;
     --sidebar-bg: #161b22;
+    --ok-fg: #3fb950;
   }
 }
 
@@ -677,6 +679,41 @@ details[open] > summary::before { transform: rotate(90deg); }
 /* ---------------- search hidden rows ---------------- */
 tr.search-hidden { display: none; }
 
+/* ---------------- copy button on raw-log blocks ---------------- */
+.copy-wrap { position: relative; }
+/* Keep the first line clear of the button. <pre> scrolls horizontally, so the
+   extra padding just widens the scroll area; <ul> items wrap instead. */
+.copy-wrap > pre, .copy-wrap > ul { padding-right: 70px; }
+.copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  z-index: 2;
+  padding: 2px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--muted-fg);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.7;
+  cursor: pointer;
+  opacity: 0.55;
+  transition: opacity 0.15s, color 0.15s, border-color 0.15s;
+}
+.copy-wrap:hover > .copy-btn, .copy-btn:focus { opacity: 1; }
+.copy-btn:hover { color: var(--link); border-color: var(--link); }
+.copy-btn.done, .copy-wrap:hover > .copy-btn.done {
+  color: var(--ok-fg);
+  border-color: var(--ok-fg);
+  opacity: 1;
+}
+.copy-btn.fail, .copy-wrap:hover > .copy-btn.fail {
+  color: var(--warn-fg);
+  border-color: var(--warn-fg);
+  opacity: 1;
+}
+
 /* ---------------- print ---------------- */
 @media print {
   .topbar, .sidebar { display: none; }
@@ -685,6 +722,8 @@ tr.search-hidden { display: none; }
   details { break-inside: avoid; }
   details:not([open]) { display: none; }
   table { page-break-inside: avoid; }
+  .copy-btn { display: none; }
+  .copy-wrap > pre, .copy-wrap > ul { padding-right: 0; }
 }
 """
 
@@ -790,6 +829,110 @@ _JS = r"""
     window.addEventListener('scroll', onScroll, {passive: true});
     onScroll();
   }
+
+
+  // ---------- 5. copy button on every raw-log block ----------
+  // Scope: the Message/dmesg subsections that actually hold raw log text --
+  // "Xid Raw Logs" (one <pre> per event group), "Other GPU Related" and
+  // "Other Warnings" (a <ul> of log lines each). Matched on heading TEXT, not
+  // number, because top-level section numbers are generated dynamically.
+  var RAW_LOG_HEADING = /(Xid Raw Logs|Other GPU Related|Other Warnings)\s*$/;
+
+  function copyText(text) {
+    // execCommand is deprecated but synchronous and works on file:// in every
+    // browser; navigator.clipboard is the async fallback.
+    var sel = window.getSelection ? window.getSelection() : null;
+    var saved = [];
+    if (sel) {
+      for (var i = 0; i < sel.rangeCount; i++) saved.push(sel.getRangeAt(i));
+    }
+    var ok = false;
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;top:0;left:-9999px;opacity:0;';
+    document.body.appendChild(ta);
+    try {
+      ta.select();
+      ta.setSelectionRange(0, text.length);
+      ok = document.execCommand('copy');
+    } catch (e) {
+      ok = false;
+    }
+    document.body.removeChild(ta);
+    if (sel) {
+      try {
+        sel.removeAllRanges();
+        saved.forEach(function (r) { sel.addRange(r); });
+      } catch (e) { /* restoring the highlight is best effort */ }
+    }
+    if (ok) return Promise.resolve(true);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).then(
+        function () { return true; },
+        function () { return false; }
+      );
+    }
+    return Promise.resolve(false);
+  }
+
+  // <pre> holds the log verbatim. A <ul> holds one log line per <li>; those
+  // items are rendered as "[ts] `line`" or just "`line`", and the inline
+  // <code> already contains the full line, so prefer it over the <li> text to
+  // avoid copying the timestamp twice.
+  function blockText(el) {
+    // <pre><code> carries a trailing newline; don't paste a blank last line.
+    if (el.tagName === 'PRE') return (el.innerText || el.textContent || '').replace(/\s+$/, '');
+    var out = [];
+    el.querySelectorAll('li').forEach(function (li) {
+      var code = li.querySelector('code');
+      var t = ((code || li).innerText || (code || li).textContent || '').trim();
+      if (t) out.push(t);
+    });
+    return out.join('\n');
+  }
+
+  function addCopyButton(el) {
+    if (el.parentNode && el.parentNode.classList.contains('copy-wrap')) return;
+    var wrap = document.createElement('div');
+    wrap.className = 'copy-wrap';
+    el.parentNode.insertBefore(wrap, el);
+    wrap.appendChild(el);
+
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'copy-btn';
+    btn.textContent = 'Copy';
+    btn.title = 'Copy this raw log block to the clipboard';
+    wrap.appendChild(btn);
+
+    btn.addEventListener('click', function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();          // never toggle the enclosing <details>
+      copyText(blockText(el)).then(function (ok) {
+        var lines = blockText(el).split('\n').length;
+        btn.textContent = ok
+          ? 'Copied ' + lines + (lines === 1 ? ' line' : ' lines')
+          : 'Copy failed';
+        btn.classList.add(ok ? 'done' : 'fail');
+        clearTimeout(btn._resetTimer);
+        btn._resetTimer = setTimeout(function () {
+          btn.textContent = 'Copy';
+          btn.classList.remove('done', 'fail');
+        }, 2000);
+      });
+    });
+  }
+
+  document.querySelectorAll('.content h3').forEach(function (head) {
+    if (!RAW_LOG_HEADING.test((head.innerText || head.textContent || '').trim())) return;
+    var node = head.nextElementSibling;
+    while (node && !/^H[123]$/.test(node.tagName)) {
+      if (node.tagName === 'PRE' || node.tagName === 'UL') addCopyButton(node);
+      node.querySelectorAll('pre, ul').forEach(addCopyButton);
+      node = node.nextElementSibling;
+    }
+  });
 })();
 """
 
