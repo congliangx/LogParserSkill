@@ -680,38 +680,41 @@ details[open] > summary::before { transform: rotate(90deg); }
 tr.search-hidden { display: none; }
 
 /* ---------------- copy button on raw-log blocks ---------------- */
-.copy-wrap { position: relative; }
-/* Keep the first line clear of the button. <pre> scrolls horizontally, so the
-   extra padding just widens the scroll area; <ul> items wrap instead. */
-.copy-wrap > pre, .copy-wrap > ul { padding-right: 70px; }
+/* The button sits on its own line ABOVE the block, right-aligned -- never
+   overlaid on it. Overlaying looked tidy but failed in practice: <pre> scrolls
+   horizontally, so long log lines slide underneath the button, and a table's
+   sticky header row would be covered by it. Its own strip costs one line and
+   is unambiguous. */
+.copy-wrap { margin: 0.6em 0; }
 .copy-btn {
-  position: absolute;
-  top: 6px;
-  right: 8px;
-  z-index: 2;
-  padding: 2px 9px;
+  display: block;
+  margin: 0 0 5px auto;
+  padding: 3px 12px;
   border: 1px solid var(--border-strong);
   border-radius: 5px;
-  background: var(--bg);
-  color: var(--muted-fg);
+  background: var(--th-bg);
+  color: var(--fg);
   font-family: inherit;
-  font-size: 11px;
-  line-height: 1.7;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.6;
   cursor: pointer;
-  opacity: 0.55;
-  transition: opacity 0.15s, color 0.15s, border-color 0.15s;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
-.copy-wrap:hover > .copy-btn, .copy-btn:focus { opacity: 1; }
-.copy-btn:hover { color: var(--link); border-color: var(--link); }
-.copy-btn.done, .copy-wrap:hover > .copy-btn.done {
+.copy-btn:hover {
+  background: var(--link);
+  border-color: var(--link);
+  color: var(--bg);
+}
+.copy-btn.done {
+  background: transparent;
   color: var(--ok-fg);
   border-color: var(--ok-fg);
-  opacity: 1;
 }
-.copy-btn.fail, .copy-wrap:hover > .copy-btn.fail {
+.copy-btn.fail {
+  background: var(--warn-bg);
   color: var(--warn-fg);
   border-color: var(--warn-fg);
-  opacity: 1;
 }
 
 /* ---------------- print ---------------- */
@@ -723,7 +726,6 @@ tr.search-hidden { display: none; }
   details:not([open]) { display: none; }
   table { page-break-inside: avoid; }
   .copy-btn { display: none; }
-  .copy-wrap > pre, .copy-wrap > ul { padding-right: 0; }
 }
 """
 
@@ -832,11 +834,17 @@ _JS = r"""
 
 
   // ---------- 5. copy button on every raw-log block ----------
-  // Scope: the Message/dmesg subsections that actually hold raw log text --
-  // "Xid Raw Logs" (one <pre> per event group), "Other GPU Related" and
-  // "Other Warnings" (a <ul> of log lines each). Matched on heading TEXT, not
-  // number, because top-level section numbers are generated dynamically.
-  var RAW_LOG_HEADING = /(Xid Raw Logs|Other GPU Related|Other Warnings)\s*$/;
+  // Scope: the sections that actually hold raw log text.
+  //   per-node   "Xid Raw Logs"          one <pre> per event group
+  //              "Other GPU Related"     a <ul> of log lines
+  //              "Other Warnings"        a <ul> of log lines
+  //   cross-node "Xid Unified Timeline"  one <table> per event group, raw log
+  //                                      in the last column
+  // Matched on heading TEXT, not number, because section numbers are generated
+  // dynamically. h2 as well as h3: the cross-node timeline is a top-level
+  // section while the per-node blocks are subsections.
+  var RAW_LOG_HEADING =
+    /(Xid Raw Logs|Other GPU Related|Other Warnings|Xid Unified Timeline)\s*$/;
 
   function copyText(text) {
     // execCommand is deprecated but synchronous and works on file:// in every
@@ -876,35 +884,68 @@ _JS = r"""
     return Promise.resolve(false);
   }
 
-  // <pre> holds the log verbatim. A <ul> holds one log line per <li>; those
-  // items are rendered as "[ts] `line`" or just "`line`", and the inline
-  // <code> already contains the full line, so prefer it over the <li> text to
-  // avoid copying the timestamp twice.
+  function cellText(el) {
+    return el ? ((el.innerText || el.textContent || '').trim()) : '';
+  }
+
+  // Three shapes, one contract: return only the raw log lines, one per line.
+  //   <pre>   holds the log verbatim.
+  //   <ul>    one line per <li>, rendered as "[ts] `line`" or just "`line`";
+  //           the inline <code> already holds the whole line, so prefer it over
+  //           the <li> text -- otherwise the timestamp is copied twice.
+  //   <table> the cross-node timeline; Time/Hostname/BDF/Xid are all restated
+  //           inside the raw line itself, so take the last cell only. Its
+  //           <code> is a log line and its <em> is a "+N more ... suppressed"
+  //           note, which the <pre> renderer also keeps inline.
   function blockText(el) {
     // <pre><code> carries a trailing newline; don't paste a blank last line.
-    if (el.tagName === 'PRE') return (el.innerText || el.textContent || '').replace(/\s+$/, '');
+    if (el.tagName === 'PRE') {
+      return (el.innerText || el.textContent || '').replace(/\s+$/, '');
+    }
     var out = [];
+    if (el.tagName === 'TABLE') {
+      var body = el.tBodies && el.tBodies[0] ? el.tBodies[0] : el;
+      Array.prototype.forEach.call(body.rows || [], function (row) {
+        var last = row.cells[row.cells.length - 1];
+        if (!last) return;
+        var t = cellText(last.querySelector('code') || last.querySelector('em') || last);
+        if (t) out.push(t);
+      });
+      return out.join('\n');
+    }
     el.querySelectorAll('li').forEach(function (li) {
-      var code = li.querySelector('code');
-      var t = ((code || li).innerText || (code || li).textContent || '').trim();
+      var t = cellText(li.querySelector('code') || li);
       if (t) out.push(t);
     });
     return out.join('\n');
   }
 
-  function addCopyButton(el) {
-    if (el.parentNode && el.parentNode.classList.contains('copy-wrap')) return;
+  // `content` is what gets copied; `box` is what gets wrapped for positioning.
+  // They differ for tables: _wrap_tables_in_scroll_div already put the <table>
+  // inside a horizontally scrolling .table-wrap, and a button parked in there
+  // would scroll off with the columns, so we wrap that div instead.
+  function addCopyButton(content) {
+    var box = content;
+    if (content.tagName === 'TABLE') {
+      var scroller = content.parentNode;
+      if (scroller && scroller.tagName === 'DIV' &&
+          scroller.classList.contains('table-wrap')) {
+        box = scroller;
+      }
+    }
+    if (box.parentNode && box.parentNode.classList.contains('copy-wrap')) return;
+    var el = content;
     var wrap = document.createElement('div');
     wrap.className = 'copy-wrap';
-    el.parentNode.insertBefore(wrap, el);
-    wrap.appendChild(el);
+    box.parentNode.insertBefore(wrap, box);
+    wrap.appendChild(box);
 
     var btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'copy-btn';
     btn.textContent = 'Copy';
     btn.title = 'Copy this raw log block to the clipboard';
-    wrap.appendChild(btn);
+    wrap.insertBefore(btn, box);   // above the block, not over it
 
     btn.addEventListener('click', function (ev) {
       ev.preventDefault();
@@ -924,12 +965,12 @@ _JS = r"""
     });
   }
 
-  document.querySelectorAll('.content h3').forEach(function (head) {
+  document.querySelectorAll('.content h2, .content h3').forEach(function (head) {
     if (!RAW_LOG_HEADING.test((head.innerText || head.textContent || '').trim())) return;
     var node = head.nextElementSibling;
     while (node && !/^H[123]$/.test(node.tagName)) {
-      if (node.tagName === 'PRE' || node.tagName === 'UL') addCopyButton(node);
-      node.querySelectorAll('pre, ul').forEach(addCopyButton);
+      if (/^(PRE|UL|TABLE)$/.test(node.tagName)) addCopyButton(node);
+      node.querySelectorAll('pre, ul, table').forEach(addCopyButton);
       node = node.nextElementSibling;
     }
   });

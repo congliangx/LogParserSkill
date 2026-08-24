@@ -105,7 +105,7 @@ Report file is named `<original-filename>-analysis-report.md`, saved in the `rep
 - Auto-generated left sidebar TOC with active-section highlight.
 - Click-header table sort, top-bar live row filter, expand/collapse all `<details>`.
 - Auto light/dark theme via `prefers-color-scheme`.
-- **Copy button** on every raw-log block in the Message/dmesg subsections — each §7.3 event group, plus §7.4 Other GPU Related and §7.5 Other Warnings. Each block carries a dimmed `Copy` control at its top-right that brightens on hover; clicking it puts the block's raw log lines on the clipboard (`Copied N lines` confirms) without expanding or collapsing the enclosing `<details>`. Purely a renderer feature — the `.md` carries no button markup, so markdown viewers are unaffected.
+- **Copy button** on every raw-log block — per-node: each §7.3 event group, §7.4 Other GPU Related and §7.5 Other Warnings; cross-node: each §4 Xid Unified Timeline event group (whose raw log lives in a table's last column, so only that column is copied — Time / Hostname / BDF / Xid are all restated inside the raw line itself). Each block carries a dimmed `Copy` control at its top-right that brightens on hover; clicking it puts the block's raw log lines on the clipboard (`Copied N lines` confirms) without expanding or collapsing the enclosing `<details>`. Purely a renderer feature — the `.md` carries no button markup, so markdown viewers are unaffected.
 - Fully self-contained: CSS+JS embedded, no CDN, opens offline in any browser.
 
 Open with `open <name>.html` (macOS) / `xdg-open <name>.html` (Linux).
@@ -140,7 +140,7 @@ Batch mode will:
    - File overview (hostname, system SN, chassis SN, slot#, tray#, boot time, message start time, collect date)
    - IMEX Node Disconnect Timeline (all nodes' "Node disconnect event detected" ERROR entries merged and sorted by time, grouped by burst, gap > 1 min = new event group)
    - Xid comparison matrix (node × Xid number) + companion subsection 3.1 NVLink Sub-type Breakdown (per host × GPU × Xid 144-150 × Category × Severity, long format; collapsed by default; entire subsection omitted when no Xid 144-150 anywhere in the batch)
-   - Xid unified timeline (all files' Xid merged and sorted by time, grouped by burst, gap > 1 min = new event group; each event group annotated with related IMEX disconnect event groups within +/- 1 min)
+   - Xid unified timeline (all files' Xid merged and sorted by time, grouped by burst, gap > 1 min = new event group; each event group annotated with related IMEX disconnect event groups within +/- 1 min, and given a **Copy** button in the HTML sidecar that yields its raw log lines)
    - Xid decode summary (merged and deduplicated)
    - Cross-node comparison summary (common/unique Xid types analysis; agent appends dmesg/messages cross-node Analysis Summary as subsection 6.1 per Step 2.6)
 
