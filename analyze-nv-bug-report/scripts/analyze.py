@@ -92,19 +92,36 @@ def _batch_process_one(fp_and_out):
 # "Report saved" line as "done". Say so out loud, every time, next to the path.
 _STEP_27_REMINDER = """\
 [REMINDER] INCOMPLETE REPORT: Section 8 has only the deterministic Critical/Warning/OK baseline.
-           The mandatory `### AI Deep Analysis` block (SKILL.md Step 2.7) is written by the
-           agent, not by this script. Append it, re-render the HTML, then verify:
+           The `### AI Deep Analysis` block (SKILL.md Step 2.7) is written by the agent, not by
+           this script. Append it -- or, if the user declined at Step 1.5, the skip marker --
+           then re-render the HTML and verify:
              grep -c '### AI Deep Analysis' {target}   # must be >= 1 on every line
            This applies even if this run was only a test -- the file on disk is a deliverable."""
 
+# Batch runs owe one more block than the per-node count, and the cross-node one
+# is the easy one to lose: the "Batch analysis complete" line mentions the file
+# only in passing, so name it explicitly here.
+_STEP_26_REMINDER = """\
+           Batch mode also owes Section 6.1 on the cross-node report (SKILL.md Step 2.6):
+             grep -c '### 6.1 Analysis Summary' {cross}   # must be >= 1
+           {n} per-node report(s) + 1 cross-node report = {total} agent-written blocks."""
 
-def _warn_step_27(target):
-    """Print the Step 2.7 reminder to stderr after report(s) hit the disk.
+
+def _warn_step_27(target, cross_node=None, n_reports=0):
+    """Print the AI-analysis reminders to stderr after report(s) hit the disk.
 
     ``target`` is the path (or glob) the agent should run the verification
-    grep against, so the printed command is copy-pasteable as-is.
+    grep against, so the printed command is copy-pasteable as-is. When
+    ``cross_node`` is given (batch mode) the Step 2.6 reminder is printed too.
     """
     print(_STEP_27_REMINDER.format(target=target), file=sys.stderr)
+    if cross_node:
+        print(
+            _STEP_26_REMINDER.format(
+                cross=cross_node, n=n_reports, total=n_reports + 1
+            ),
+            file=sys.stderr,
+        )
 
 
 def save_report(result, output_dir, prefix_parent_dir=False):
@@ -223,7 +240,11 @@ def main():
                     f"cross-node report: {cross_path}",
                     flush=True,
                 )
-                _warn_step_27(os.path.join(output_dir, "*-analysis-report.md"))
+                _warn_step_27(
+                    os.path.join(output_dir, "*-analysis-report.md"),
+                    cross_node=cross_path,
+                    n_reports=len(all_results),
+                )
         elif explicit_output_dir:
             print(
                 "Batch analysis complete: no valid input files; no reports generated.",
