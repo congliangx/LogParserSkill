@@ -391,6 +391,7 @@ _CSS = r"""
   --topbar-bg: #24292f;
   --topbar-fg: #ffffff;
   --sidebar-bg: #f6f8fa;
+  --ok-fg: #1a7f37;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -415,6 +416,7 @@ _CSS = r"""
     --topbar-bg: #161b22;
     --topbar-fg: #e6edf3;
     --sidebar-bg: #161b22;
+    --ok-fg: #3fb950;
   }
 }
 
@@ -677,6 +679,44 @@ details[open] > summary::before { transform: rotate(90deg); }
 /* ---------------- search hidden rows ---------------- */
 tr.search-hidden { display: none; }
 
+/* ---------------- copy button on raw-log blocks ---------------- */
+/* The button sits on its own line ABOVE the block, right-aligned -- never
+   overlaid on it. Overlaying looked tidy but failed in practice: <pre> scrolls
+   horizontally, so long log lines slide underneath the button, and a table's
+   sticky header row would be covered by it. Its own strip costs one line and
+   is unambiguous. */
+.copy-wrap { margin: 0.6em 0; }
+.copy-btn {
+  display: block;
+  margin: 0 0 5px auto;
+  padding: 3px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  background: var(--th-bg);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.6;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.copy-btn:hover {
+  background: var(--link);
+  border-color: var(--link);
+  color: var(--bg);
+}
+.copy-btn.done {
+  background: transparent;
+  color: var(--ok-fg);
+  border-color: var(--ok-fg);
+}
+.copy-btn.fail {
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+  border-color: var(--warn-fg);
+}
+
 /* ---------------- print ---------------- */
 @media print {
   .topbar, .sidebar { display: none; }
@@ -685,6 +725,7 @@ tr.search-hidden { display: none; }
   details { break-inside: avoid; }
   details:not([open]) { display: none; }
   table { page-break-inside: avoid; }
+  .copy-btn { display: none; }
 }
 """
 
@@ -790,6 +831,149 @@ _JS = r"""
     window.addEventListener('scroll', onScroll, {passive: true});
     onScroll();
   }
+
+
+  // ---------- 5. copy button on every raw-log block ----------
+  // Scope: the sections that actually hold raw log text.
+  //   per-node   "Xid Raw Logs"          one <pre> per event group
+  //              "Other GPU Related"     a <ul> of log lines
+  //              "Other Warnings"        a <ul> of log lines
+  //   cross-node "Xid Unified Timeline"  one <table> per event group, raw log
+  //                                      in the last column
+  // Matched on heading TEXT, not number, because section numbers are generated
+  // dynamically. h2 as well as h3: the cross-node timeline is a top-level
+  // section while the per-node blocks are subsections.
+  var RAW_LOG_HEADING =
+    /(Xid Raw Logs|Other GPU Related|Other Warnings|Xid Unified Timeline)\s*$/;
+
+  function copyText(text) {
+    // execCommand is deprecated but synchronous and works on file:// in every
+    // browser; navigator.clipboard is the async fallback.
+    var sel = window.getSelection ? window.getSelection() : null;
+    var saved = [];
+    if (sel) {
+      for (var i = 0; i < sel.rangeCount; i++) saved.push(sel.getRangeAt(i));
+    }
+    var ok = false;
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;top:0;left:-9999px;opacity:0;';
+    document.body.appendChild(ta);
+    try {
+      ta.select();
+      ta.setSelectionRange(0, text.length);
+      ok = document.execCommand('copy');
+    } catch (e) {
+      ok = false;
+    }
+    document.body.removeChild(ta);
+    if (sel) {
+      try {
+        sel.removeAllRanges();
+        saved.forEach(function (r) { sel.addRange(r); });
+      } catch (e) { /* restoring the highlight is best effort */ }
+    }
+    if (ok) return Promise.resolve(true);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).then(
+        function () { return true; },
+        function () { return false; }
+      );
+    }
+    return Promise.resolve(false);
+  }
+
+  function cellText(el) {
+    return el ? ((el.innerText || el.textContent || '').trim()) : '';
+  }
+
+  // Three shapes, one contract: return only the raw log lines, one per line.
+  //   <pre>   holds the log verbatim.
+  //   <ul>    one line per <li>, rendered as "[ts] `line`" or just "`line`";
+  //           the inline <code> already holds the whole line, so prefer it over
+  //           the <li> text -- otherwise the timestamp is copied twice.
+  //   <table> the cross-node timeline; Time/Hostname/BDF/Xid are all restated
+  //           inside the raw line itself, so take the last cell only. Its
+  //           <code> is a log line and its <em> is a "+N more ... suppressed"
+  //           note, which the <pre> renderer also keeps inline.
+  function blockText(el) {
+    // <pre><code> carries a trailing newline; don't paste a blank last line.
+    if (el.tagName === 'PRE') {
+      return (el.innerText || el.textContent || '').replace(/\s+$/, '');
+    }
+    var out = [];
+    if (el.tagName === 'TABLE') {
+      var body = el.tBodies && el.tBodies[0] ? el.tBodies[0] : el;
+      Array.prototype.forEach.call(body.rows || [], function (row) {
+        var last = row.cells[row.cells.length - 1];
+        if (!last) return;
+        var t = cellText(last.querySelector('code') || last.querySelector('em') || last);
+        if (t) out.push(t);
+      });
+      return out.join('\n');
+    }
+    el.querySelectorAll('li').forEach(function (li) {
+      var t = cellText(li.querySelector('code') || li);
+      if (t) out.push(t);
+    });
+    return out.join('\n');
+  }
+
+  // `content` is what gets copied; `box` is what gets wrapped for positioning.
+  // They differ for tables: _wrap_tables_in_scroll_div already put the <table>
+  // inside a horizontally scrolling .table-wrap, and a button parked in there
+  // would scroll off with the columns, so we wrap that div instead.
+  function addCopyButton(content) {
+    var box = content;
+    if (content.tagName === 'TABLE') {
+      var scroller = content.parentNode;
+      if (scroller && scroller.tagName === 'DIV' &&
+          scroller.classList.contains('table-wrap')) {
+        box = scroller;
+      }
+    }
+    if (box.parentNode && box.parentNode.classList.contains('copy-wrap')) return;
+    var el = content;
+    var wrap = document.createElement('div');
+    wrap.className = 'copy-wrap';
+    box.parentNode.insertBefore(wrap, box);
+    wrap.appendChild(box);
+
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'copy-btn';
+    btn.textContent = 'Copy';
+    btn.title = 'Copy this raw log block to the clipboard';
+    wrap.insertBefore(btn, box);   // above the block, not over it
+
+    btn.addEventListener('click', function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();          // never toggle the enclosing <details>
+      copyText(blockText(el)).then(function (ok) {
+        var lines = blockText(el).split('\n').length;
+        btn.textContent = ok
+          ? 'Copied ' + lines + (lines === 1 ? ' line' : ' lines')
+          : 'Copy failed';
+        btn.classList.add(ok ? 'done' : 'fail');
+        clearTimeout(btn._resetTimer);
+        btn._resetTimer = setTimeout(function () {
+          btn.textContent = 'Copy';
+          btn.classList.remove('done', 'fail');
+        }, 2000);
+      });
+    });
+  }
+
+  document.querySelectorAll('.content h2, .content h3').forEach(function (head) {
+    if (!RAW_LOG_HEADING.test((head.innerText || head.textContent || '').trim())) return;
+    var node = head.nextElementSibling;
+    while (node && !/^H[123]$/.test(node.tagName)) {
+      if (/^(PRE|UL|TABLE)$/.test(node.tagName)) addCopyButton(node);
+      node.querySelectorAll('pre, ul, table').forEach(addCopyButton);
+      node = node.nextElementSibling;
+    }
+  });
 })();
 """
 
