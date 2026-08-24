@@ -85,6 +85,28 @@ def _batch_process_one(fp_and_out):
     }
 
 
+# Section 8's `### AI Deep Analysis` block is written by the LLM agent, never by
+# this script (SKILL.md Step 2.7). A report that leaves here is therefore always
+# incomplete, and the easiest way to forget that is to run analyze.py for some
+# unrelated reason -- a smoke test, a renderer change -- and then treat the
+# "Report saved" line as "done". Say so out loud, every time, next to the path.
+_STEP_27_REMINDER = """\
+[REMINDER] INCOMPLETE REPORT: Section 8 has only the deterministic Critical/Warning/OK baseline.
+           The mandatory `### AI Deep Analysis` block (SKILL.md Step 2.7) is written by the
+           agent, not by this script. Append it, re-render the HTML, then verify:
+             grep -c '### AI Deep Analysis' {target}   # must be >= 1 on every line
+           This applies even if this run was only a test -- the file on disk is a deliverable."""
+
+
+def _warn_step_27(target):
+    """Print the Step 2.7 reminder to stderr after report(s) hit the disk.
+
+    ``target`` is the path (or glob) the agent should run the verification
+    grep against, so the printed command is copy-pasteable as-is.
+    """
+    print(_STEP_27_REMINDER.format(target=target), file=sys.stderr)
+
+
 def save_report(result, output_dir, prefix_parent_dir=False):
     """Save a single-file analysis report to disk.
 
@@ -201,6 +223,7 @@ def main():
                     f"cross-node report: {cross_path}",
                     flush=True,
                 )
+                _warn_step_27(os.path.join(output_dir, "*-analysis-report.md"))
         elif explicit_output_dir:
             print(
                 "Batch analysis complete: no valid input files; no reports generated.",
@@ -220,10 +243,12 @@ def main():
         result = analyze_single_file(filepath, artifact_root_dir=output_dir)
         if explicit_output_dir:
             report_path = save_report(result, output_dir, prefix_parent_dir=True)
+            _warn_step_27(report_path)
             print(f"Analysis complete: {report_path}", flush=True)
         else:
             print(result["report"])
-            save_report(result, output_dir, prefix_parent_dir=True)
+            saved = save_report(result, output_dir, prefix_parent_dir=True)
+            _warn_step_27(saved)
 
 
 if __name__ == "__main__":
