@@ -1,11 +1,18 @@
 """Default analysis configuration."""
 
 from dataclasses import dataclass
+from typing import Optional
+
+from .time_range import TimeWindow
 
 
 @dataclass
 class AnalysisConfig:
     """Runtime options aligned with nvos_parser FM -vvv behavior."""
+
+    # Inclusive log-record window. None = process the full dump (default).
+    # Applied to parsed NVLSM / FM records before grouping and report build.
+    time_window: Optional[TimeWindow] = None
 
     # Fabric Manager: no file cap, no age cutoff (equivalent to -vvv)
     fm_max_log_files: int = 0  # 0 = unlimited

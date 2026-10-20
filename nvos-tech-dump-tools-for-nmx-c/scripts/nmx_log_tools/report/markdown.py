@@ -15,7 +15,11 @@ from .renderer import MdRenderer
 def render_markdown(bundle: AnalysisBundle) -> str:
     r = MdRenderer()
     r.heading(1, "NMX-C Log Analysis Report")
-    r.bullets([f"{r.i_bold('Input:')} {r.i_code(str(bundle.input_path))}"])
+    bullets = [f"{r.i_bold('Input:')} {r.i_code(str(bundle.input_path))}"]
+    window = bundle.config.time_window
+    if window is not None:
+        bullets.append(r.i_bold("Log coverage:") + " " + r.i_text(window.coverage_notice()))
+    r.bullets(bullets)
     if bundle.errors:
         r.bullets(
             [f"{r.i_bold('Warnings:')}"]

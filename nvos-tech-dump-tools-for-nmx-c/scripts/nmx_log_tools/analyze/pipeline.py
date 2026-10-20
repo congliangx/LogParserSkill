@@ -18,6 +18,7 @@ from ..parsers.nvlsm_forensics import NvlsmForensicsAnalyzer
 from ..parsers.nvlsm_health import parse_nvlsm_logs
 from ..platform_identity import dump_root_from_nmx_c, format_node_title, load_node_identity
 from ..sources.base import DumpSource
+from ..time_range import filter_fm_events
 
 
 @dataclass
@@ -60,9 +61,14 @@ def analyze_source(source: DumpSource, input_path: Path, cfg: AnalysisConfig) ->
             node_title=format_node_title(identity, fallback_label=label),
         )
 
+        window = cfg.time_window
         nvlsm_logs = collect_nvlsm_log_files(nmx_c)
         if nvlsm_logs:
-            node.nvlsm_health = parse_nvlsm_logs(nvlsm_logs, extract_port_events=True)
+            node.nvlsm_health = parse_nvlsm_logs(
+                nvlsm_logs,
+                extract_port_events=True,
+                time_window=window,
+            )
             group_port_events_input = port_events_for_event_group_report(
                 node.nvlsm_health.port_events,
             )
@@ -74,7 +80,7 @@ def analyze_source(source: DumpSource, input_path: Path, cfg: AnalysisConfig) ->
                 port_wave_gap_seconds=cfg.nvlsm_port_wave_gap_seconds,
             )
             forensics = NvlsmForensicsAnalyzer()
-            forensics.parse_logs(nvlsm_logs)
+            forensics.parse_logs(nvlsm_logs, time_window=window)
             node.nvlsm_forensics = forensics.finalize()
 
         fm_logs = collect_fabric_manager_logs(nmx_c, unlimited=unlimited_fm)
@@ -94,7 +100,7 @@ def analyze_source(source: DumpSource, input_path: Path, cfg: AnalysisConfig) ->
             except OSError as e:
                 bundle.errors.append(f"FM read failed {fp}: {e}")
 
-        node.fm_events = all_events
+        node.fm_events = filter_fm_events(all_events, window)
         # Single pass over fm_events: tally categories AND extract the
         # interesting buckets the report needs. Avoids re-walking the list.
         counts: Dict[str, int] = {}
@@ -102,7 +108,7 @@ def analyze_source(source: DumpSource, input_path: Path, cfg: AnalysisConfig) ->
         sw_info_failures: List[Dict[str, Any]] = []
         partition_errors: List[Dict[str, Any]] = []
         multicast_team_limits: List[Dict[str, Any]] = []
-        for ev in all_events:
+        for ev in node.fm_events:
             cat = ev.get("category") or "generic"
             counts[cat] = counts.get(cat, 0) + 1
             if cat == "fm_lifecycle":
