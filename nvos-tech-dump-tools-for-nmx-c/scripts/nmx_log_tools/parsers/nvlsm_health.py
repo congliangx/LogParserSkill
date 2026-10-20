@@ -6,9 +6,12 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple, TYPE_CHECKING
 
 from ..io.gzip_text import iter_lines
+
+if TYPE_CHECKING:
+    from ..time_range import TimeWindow
 
 
 _TIMESTAMP = re.compile(r"^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})")
@@ -120,6 +123,7 @@ def parse_nvlsm_logs(
     log_paths: List,
     *,
     extract_port_events: bool = True,
+    time_window: Optional["TimeWindow"] = None,
 ) -> NvlsmLogParseResult:
     topo = LogErrorBucket()
     utf8 = LogErrorBucket()
@@ -132,6 +136,7 @@ def parse_nvlsm_logs(
     # from an epoch field. We finalize the year in a second pass below.
     topo_ts: List[Tuple[Optional[datetime], int, str]] = []
     utf8_ts: List[Tuple[Optional[datetime], int, str]] = []
+    utf8_field_at: List[Optional[str]] = []
     tracker = YearTracker()
 
     for log_path in log_paths:
@@ -153,8 +158,9 @@ def parse_nvlsm_logs(
                 if "invalid UTF-8" in line:
                     utf8.count += 1
                     fm = _FIELD.search(line)
-                    if fm:
-                        utf8_fields.add(fm.group(1))
+                    field_name = fm.group(1) if fm else None
+                    if field_name:
+                        utf8_fields.add(field_name)
                     em = _EPOCH.search(line)
                     if em:
                         try:
@@ -165,6 +171,7 @@ def parse_nvlsm_logs(
                             utf8_ts.append((dt, tracker.offset, dt.strftime("%Y-%m-%d %H:%M:%S")))
                         except (ValueError, OSError, OverflowError):
                             utf8_ts.append((None, tracker.offset, em.group(0)))
+                        utf8_field_at.append(field_name)
                     else:
                         m = _TIMESTAMP.match(line)
                         if m:
@@ -175,6 +182,7 @@ def parse_nvlsm_logs(
                                 utf8_ts.append((dt, off, ts_str))
                             except ValueError:
                                 utf8_ts.append((None, tracker.offset, ts_str))
+                            utf8_field_at.append(field_name)
 
                 if extract_port_events and "osm_spst_rcv_process" in line:
                     m = _TIMESTAMP.match(line)
@@ -232,8 +240,33 @@ def parse_nvlsm_logs(
             out.append((dt, ts_str))
         return out
 
-    _resolve_range(topo, _finalize_stamps(topo_ts))
-    _resolve_range(utf8, _finalize_stamps(utf8_ts))
+    topo_final = _finalize_stamps(topo_ts)
+    utf8_final = _finalize_stamps(utf8_ts)
+    if time_window is not None:
+        topo_final = [
+            (dt, ts_str)
+            for dt, ts_str in topo_final
+            if time_window.contains_datetime(dt, ts_str)
+        ]
+        kept_utf8: List[Tuple[Optional[datetime], str]] = []
+        kept_fields: set = set()
+        for (dt, ts_str), field_name in zip(utf8_final, utf8_field_at):
+            if time_window.contains_datetime(dt, ts_str):
+                kept_utf8.append((dt, ts_str))
+                if field_name:
+                    kept_fields.add(field_name)
+        utf8_final = kept_utf8
+        utf8_fields = kept_fields
+        topo.count = len(topo_final)
+        utf8.count = len(utf8_final)
+        port_events = [
+            ev
+            for ev in port_events
+            if time_window.contains_datetime(ev.datetime, ev.ts)
+        ]
+
+    _resolve_range(topo, topo_final)
+    _resolve_range(utf8, utf8_final)
     utf8.fields = sorted(utf8_fields)
     port_events.sort(key=lambda e: e.datetime or datetime.min)
     return NvlsmLogParseResult(

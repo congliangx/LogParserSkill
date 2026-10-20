@@ -54,7 +54,7 @@ The tool validates that `log/nmx` exists *before* doing any heavy work. For a ta
 ### Step 2: Run the analysis
 
 ```bash
-<SKILL_ROOT>/.venv/bin/python <SKILL_ROOT>/scripts/main.py <dump_dir_or.tar.gz> -o <output_dir> [--name <basename>]
+<SKILL_ROOT>/.venv/bin/python <SKILL_ROOT>/scripts/main.py <dump_dir_or.tar.gz> -o <output_dir> [--name <basename>] [--since WHEN] [--until WHEN]
 ```
 
 Arguments:
@@ -62,6 +62,8 @@ Arguments:
 - `input` (positional): NVOS dump directory or `.tar.gz`.
 - `-o, --output-dir` (required): directory for the reports (created if missing).
 - `--name` (optional): report base filename without extension (default: `nmx_log_analysis`).
+- `--since` / `--start-time` (optional): keep records at or after this time (`YYYY-MM-DD` or `YYYY-MM-DD HH:MM[:SS]`). Date-only is `00:00:00`.
+- `--until` / `--end-time` (optional): keep records at or before this time. Date-only includes that entire day.
 
 Outputs two files in the output directory:
 
@@ -75,7 +77,41 @@ Example:
 # writes /path/to/reports/rack3_nmxc.md and /path/to/reports/rack3_nmxc.html
 ```
 
-`main.py` prints the number of `log/nmx/nmx-c` root(s) found and the two output paths; any non-fatal parse issues are listed as `Warnings:` on stderr while the report is still written.
+`main.py` prints the number of `log/nmx/nmx-c` root(s) found, the chosen log time range when one was passed, and the two output paths; any non-fatal parse issues are listed as `Warnings:` on stderr while the report is still written.
+
+#### Optional `--since` / `--until` (do this before `correlation-xid`)
+
+These flags filter **every** NVLSM and Fabric Manager record *before* grouping, FNM matching, GPU mapping, and report tables. They are optional: omitting them parses the full dump (same as before).
+
+The filter is whole-report, not per-section. When a window is set, both Markdown and HTML put a **Log coverage** line at the top of the document (`This analysis only covers related logs from …`). Do not bury an equivalent note inside a single node section.
+
+Without a window, a large dump still hits the report's display cap (`FM_LOGS_MAX_UNASSIGNED = 1200`): Fabric Manager rows *before the earliest NVLSM event group* keep only the **tail**, so early compute-tray Xids often have no matching switch-side rows for `correlation-xid`. Passing a window around the incident is the supported way to keep those early records in the report.
+
+Build `--since` / `--until` with this single procedure. Do **not** add scripts; do **not** convert hours or apply a timezone offset here (`correlation-xid` is what aligns the two clocks later).
+
+1. If the user already gave `--since` / `--until` or an incident day, use that verbatim and stop.
+2. If there is no `analyze-nv-bug-report` Markdown yet, omit the flags (full dump).
+3. Collect event-group timestamps from those reports:
+   - Prefer `cross-node-report.md` §4 **Xid Unified Timeline** headings (`Event Group N: <ts_first> ~ <ts_last>`).
+   - Otherwise each `*-nv-bug-report-analysis-report.md`: §7.3 **Xid Raw Logs** headings (`Event Group N: <ts>` or `<ts_first> ~ <ts_last>`), plus §6 **IMEX** headings if present.
+   - Year comes from §1 `Date`. If a stamp is December and `Date` is January, use year − 1.
+   - Do **not** use §1 `Boot Time` or §7 `Message Log Start`.
+4. If the collection is empty (no Xid and no IMEX event groups), omit the flags and tell the user `correlation-xid` may have little to join.
+5. Convert every collected stamp to a calendar date. Let `Dmin` be the earliest date and `Dmax` the latest. Always expand one calendar day on each side:
+   - `--since` = `Dmin − 1 day`
+   - `--until` = `Dmax + 1 day`
+   Date-only `--until` already includes that whole day. Example: event groups on `2026-03-02` only → `--since 2026-03-01 --until 2026-03-03`.
+6. Print that window in chat, then run:
+
+   ```bash
+   <SKILL_ROOT>/.venv/bin/python <SKILL_ROOT>/scripts/main.py /path/to/nvos_dump.tar.gz \
+       -o /path/to/reports --name rack3_nmxc \
+       --since 2026-03-01 --until 2026-03-03
+   ```
+
+   The report header **Log coverage** line must match the flags you passed.
+
+The ±1 day is a fixed buffer so switch-side logs still fall in the window when the two hosts print local time in different zones (up to about 12 hours). Do not compute or apply `--tz-offset-minutes` at this step.
 
 ### Step 3: What the report covers
 
@@ -106,6 +142,7 @@ Edit these only to retune grouping; the defaults mirror `nvos_parser` FM `-vvv` 
     ├── main.py         # CLI entry point
     └── nmx_log_tools/
         ├── discovery.py        # log/nmx validation + file discovery
+        ├── time_range.py       # --since/--until parsing and record filtering
         ├── platform_identity.py
         ├── config.py           # AnalysisConfig defaults
         ├── sources/            # directory vs tarball input

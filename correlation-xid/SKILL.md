@@ -53,10 +53,17 @@ ls <SKILL_ROOT>/.venv/bin/python
 
 ### Step 1: Produce the source reports first
 
-This skill consumes the *outputs* of the other two skills. If they have not been run yet, run them first:
+This skill consumes the *outputs* of the other two skills. If they have not been run yet, run them **in this order**:
 
-- `analyze-nv-bug-report` on the compute-tray `nv-bug-report.log(.gz)` files (batch mode is fine) → a `report/` directory of `*-nv-bug-report-analysis-report.md`.
-- `nvos-tech-dump-tools-for-nmx-c` on the NVOS dump(s) → `<dump>.md`.
+1. `analyze-nv-bug-report` on the compute-tray `nv-bug-report.log(.gz)` files (batch mode is fine) → a `report/` directory of `*-nv-bug-report-analysis-report.md` (and `cross-node-report.md` when batch).
+2. `nvos-tech-dump-tools-for-nmx-c` on the NVOS dump(s) → `<dump>.md`.
+3. This skill, on those two report sets.
+
+**Pass a time window into step 2.** Unfiltered NVOS dumps are often weeks of Fabric Manager history; the NVOS report then drops the oldest pre-NVLSM FM rows (display cap 1200), and this skill cannot correlate early compute-tray Xids to switch-side evidence that never made the report.
+
+Do **not** write extra Python to extract the window. Follow `nvos-tech-dump-tools-for-nmx-c/SKILL.md` **Optional `--since` / `--until`** exactly: read the nv-bug-report Markdown (prefer `cross-node-report.md` §4, else per-node §7.3 / §6), take min/max event-group calendar dates, expand one day on each side, pass `--since YYYY-MM-DD --until YYYY-MM-DD`. Print the window in chat, then run the NVOS CLI. Honour a user-supplied window. If there are no Xid and no IMEX event groups, run NVOS unfiltered and say so. Do not apply a timezone offset when building these flags — that is Step 3 of *this* skill, after both reports exist.
+
+If NVOS reports already exist **without** a header **Log coverage** line and correlation later shows many uncorrelated Xids in a time range the dump should have covered, re-run NVOS with the derived window rather than correlating the truncated report.
 
 ### Step 2: Run the correlation
 

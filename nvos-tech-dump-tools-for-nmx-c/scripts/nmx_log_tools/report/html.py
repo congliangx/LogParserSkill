@@ -518,6 +518,11 @@ def render_html(bundle: AnalysisBundle) -> str:
     r.paragraph(
         f"{r.i_bold('Input:')} {r.i_code(str(bundle.input_path))}"
     )
+    window = bundle.config.time_window
+    if window is not None:
+        r.paragraph(
+            f"{r.i_bold('Log coverage:')} {r.i_text(window.coverage_notice())}"
+        )
     if bundle.errors:
         r.bullets([r.i_text(e) for e in bundle.errors])
     r.parts.append("</div>")

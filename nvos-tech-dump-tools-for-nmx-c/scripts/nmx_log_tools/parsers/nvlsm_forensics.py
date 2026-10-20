@@ -4,10 +4,22 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import List, Optional, TYPE_CHECKING
 
 from ..io.gzip_text import iter_lines
+from .nvlsm_health import YearTracker, infer_reference_year
+
+if TYPE_CHECKING:
+    from ..time_range import TimeWindow
+
+
+_STATE_TS = re.compile(r"(\w+ \d+ \d+:\d+:\d+)")
+_INIT = re.compile(r"(\w+ \d+ \d+:\d+:\d+).*guid\s+(0x[a-fA-F0-9]+).*port\s+(\d+)")
+_UNLINK = re.compile(
+    r"(\w+ \d+ \d+:\d+:\d+).*Unlinking.*node\s+(0x[a-fA-F0-9]+).*port\s+(\d+)\(([^)]+)\)"
+)
 
 
 @dataclass
@@ -26,26 +38,53 @@ class NvlsmForensicsAnalyzer:
         self.log_lines = 0
         self.log_files = 0
 
-    def parse_logs(self, log_paths: List[Path]) -> None:
+    @staticmethod
+    def _line_is_state_change(line: str) -> bool:
+        if "setting state to INIT" in line and _INIT.search(line):
+            return True
+        if "Unlinking" in line and _UNLINK.search(line):
+            return True
+        return False
+
+    def parse_logs(
+        self,
+        log_paths: List[Path],
+        time_window: Optional["TimeWindow"] = None,
+    ) -> None:
         # Caller (discovery.collect_nvlsm_log_files) returns paths in
         # chronological order (oldest first).
         self.log_files = len(log_paths)
+        if time_window is None:
+            for path in log_paths:
+                for line in iter_lines(path):
+                    self.log_lines += 1
+                    if self._line_is_state_change(line):
+                        self.state_changes += 1
+            return
+
+        tracker = YearTracker()
+        pending: List[tuple] = []
         for path in log_paths:
             for line in iter_lines(path):
                 self.log_lines += 1
-                self._parse_line(line)
-
-    def _parse_line(self, line: str) -> None:
-        if "setting state to INIT" in line:
-            if re.search(r"(\w+ \d+ \d+:\d+:\d+).*guid\s+(0x[a-fA-F0-9]+).*port\s+(\d+)", line):
-                self.state_changes += 1
-
-        if "Unlinking" in line:
-            if re.search(
-                r"(\w+ \d+ \d+:\d+:\d+).*Unlinking.*node\s+(0x[a-fA-F0-9]+).*port\s+(\d+)\(([^)]+)\)",
-                line,
-            ):
-                self.state_changes += 1
+                if not self._line_is_state_change(line):
+                    continue
+                m = _STATE_TS.search(line)
+                if not m:
+                    continue
+                try:
+                    dt = datetime.strptime(m.group(1), "%b %d %H:%M:%S")
+                    off = tracker.feed(dt.month)
+                except ValueError:
+                    continue
+                pending.append((dt, off))
+        base_year = infer_reference_year(log_paths) - tracker.offset
+        n = 0
+        for dt, off in pending:
+            real = dt.replace(year=base_year + off) if dt.year == 1900 else dt
+            if time_window.contains(real):
+                n += 1
+        self.state_changes = n
 
     def finalize(self) -> ForensicsResult:
         return ForensicsResult(
