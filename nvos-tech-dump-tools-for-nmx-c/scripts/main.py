@@ -107,13 +107,17 @@ def main(argv=None) -> int:
         md_path = args.output_dir / f"{args.name}.md"
         html_path = args.output_dir / f"{args.name}.html"
 
-        md_text = render_markdown(bundle)
+        md_text, sidecars = render_markdown(bundle)
         html_text = render_html(bundle)
         md_path.write_text(md_text, encoding="utf-8")
         html_path.write_text(html_text, encoding="utf-8")
 
         print(f"Wrote {md_path}")
         print(f"Wrote {html_path}")
+        for fname, content in sidecars:
+            side_path = args.output_dir / fname
+            side_path.write_text(content, encoding="utf-8")
+            print(f"Wrote {side_path}")
         if bundle.errors:
             print("Warnings:", file=sys.stderr)
             for e in bundle.errors:

@@ -22,6 +22,11 @@ that matches the existing behavior (GitHub-flavored Markdown renders them).
 
 from __future__ import annotations
 
+import base64
+import csv
+import gzip
+import io
+import json
 import re
 from html import escape as _html_escape
 from typing import List, Optional, Tuple
@@ -31,6 +36,68 @@ from typing import List, Optional, Tuple
 # all, and TOC scroll-spy. Kept verbatim from the cross-node report styling.
 _HTML_SCRIPT = """<script>
 (function () {
+  // ---------- 0. gzip-embedded FM tables (lazy decode) ----------
+  function b64ToBytes(b64) {
+    var bin = atob(b64);
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  async function gunzipJson(bytes) {
+    if (typeof DecompressionStream !== 'function') {
+      throw new Error('This browser has no DecompressionStream');
+    }
+    var stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+    var text = await new Response(stream).text();
+    return JSON.parse(text);
+  }
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  async function decodeGzipDetails(d) {
+    if (!d || d.getAttribute('data-gz-ready') === '1') return;
+    var src = d.getAttribute('data-gz-src');
+    if (!src) return;
+    var el = document.getElementById(src);
+    var status = d.querySelector('.gzip-status');
+    var mount = d.querySelector('.gzip-mount');
+    if (!el || !mount) return;
+    d.setAttribute('data-gz-ready', '1');
+    try {
+      var cols = await gunzipJson(b64ToBytes((el.textContent || '').trim()));
+      var keys = Object.keys(cols);
+      var n = keys.length ? (cols[keys[0]] || []).length : 0;
+      var css = d.getAttribute('data-gz-css') || '';
+      var html = '<div class="table-wrap"><table' + (css ? (' class="' + css + '"') : '') + '><thead><tr>';
+      keys.forEach(function (k) { html += '<th>' + escapeHtml(k) + '</th>'; });
+      html += '</tr></thead><tbody>';
+      for (var i = 0; i < n; i++) {
+        html += '<tr>';
+        keys.forEach(function (k) {
+          html += '<td><div class="cell">' + escapeHtml(cols[k][i]) + '</div></td>';
+        });
+        html += '</tr>';
+      }
+      html += '</tbody></table></div>';
+      mount.innerHTML = html;
+      if (status) {
+        status.textContent = n.toLocaleString() + ' rows decoded from gzip(JSON).';
+      }
+      var table = mount.querySelector('table');
+      if (table) bindTableSort(table);
+    } catch (err) {
+      d.setAttribute('data-gz-ready', '0');
+      if (status) status.textContent = String(err);
+    }
+  }
+  document.querySelectorAll('details.gzip-table').forEach(function (d) {
+    d.addEventListener('toggle', function () {
+      if (d.open) decodeGzipDetails(d);
+    });
+  });
+
   // ---------- 1. table sort ----------
   function compareCells(a, b) {
     var na = parseFloat(a.replace(/[, ]/g, ''));
@@ -54,7 +121,7 @@ _HTML_SCRIPT = """<script>
     rows.forEach(function (r) { tbody.appendChild(r); });
   }
 
-  document.querySelectorAll('table').forEach(function (table) {
+  function bindTableSort(table) {
     var headers = table.querySelectorAll('thead th');
     headers.forEach(function (th, idx) {
       th.addEventListener('click', function () {
@@ -65,7 +132,8 @@ _HTML_SCRIPT = """<script>
       });
       th.title = 'Click to sort';
     });
-  });
+  }
+  document.querySelectorAll('table').forEach(bindTableSort);
 
   // ---------- 2. search box ----------
   var searchBox = document.getElementById('search-box');
@@ -73,7 +141,15 @@ _HTML_SCRIPT = """<script>
     var debounceTimer = null;
     searchBox.addEventListener('input', function () {
       clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(function () { applyFilter(searchBox.value); }, 120);
+      debounceTimer = setTimeout(function () {
+        var jobs = [];
+        if ((searchBox.value || '').trim()) {
+          document.querySelectorAll('details.gzip-table').forEach(function (d) {
+            jobs.push(decodeGzipDetails(d));
+          });
+        }
+        Promise.all(jobs).then(function () { applyFilter(searchBox.value); });
+      }, 120);
     });
   }
 
@@ -101,6 +177,9 @@ _HTML_SCRIPT = """<script>
   if (expandBtn) {
     expandBtn.addEventListener('click', function () {
       document.querySelectorAll('details').forEach(function (d) { d.open = true; });
+      document.querySelectorAll('details.gzip-table').forEach(function (d) {
+        decodeGzipDetails(d);
+      });
     });
   }
   if (collapseBtn) {
@@ -234,6 +313,29 @@ class Renderer:
     def close_details(self) -> None:
         raise NotImplementedError
 
+    def gzip_fm_event_table(
+        self,
+        headers: List[str],
+        rows_cells: List[List[str]],
+        summary_label: str,
+        *,
+        red: bool = False,
+        css_class: Optional[str] = None,
+        sidecar_name: Optional[str] = None,
+    ) -> None:
+        """Overflow unassigned FM table (row count above the inline threshold).
+
+        HTML gzip-embeds; Markdown writes a sibling CSV named ``sidecar_name``.
+        The default here inlines a details+table so backends that do not
+        override still produce a readable report.
+        """
+        if not rows_cells:
+            return
+        self.open_details(self.i_text(summary_label), red=red)
+        formatted = [[self.i_text(c) for c in row] for row in rows_cells]
+        self.table(headers, formatted, css_class=css_class)
+        self.close_details()
+
     # ---- Inline formatters (return strings; do not emit) -------------------
 
     def i_text(self, s: str) -> str:
@@ -283,6 +385,7 @@ class HtmlRenderer(Renderer):
         # heading, so a shortened node label still reveals its full identity).
         self._toc: List[Tuple[int, str, str, str]] = []
         self._used_slugs: dict = {}
+        self._gz_seq = 0
 
     def _slugify(self, text: str) -> str:
         slug = re.sub(r"[^a-z0-9]+", "-", text.strip().lower()).strip("-")
@@ -374,6 +477,50 @@ class HtmlRenderer(Renderer):
             self.parts.append(f"<summary>{summary_inner}</summary>")
 
     def close_details(self) -> None:
+        self.parts.append("</details>")
+
+    def gzip_fm_event_table(
+        self,
+        headers: List[str],
+        rows_cells: List[List[str]],
+        summary_label: str,
+        *,
+        red: bool = False,
+        css_class: Optional[str] = None,
+        sidecar_name: Optional[str] = None,
+    ) -> None:
+        if not rows_cells:
+            return
+        cols = {h: [] for h in headers}
+        for row in rows_cells:
+            for idx, h in enumerate(headers):
+                cols[h].append(row[idx] if idx < len(row) else "")
+        raw = json.dumps(cols, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        b64 = base64.b64encode(gzip.compress(raw, compresslevel=9)).decode("ascii")
+        self._gz_seq += 1
+        gid = f"gz-fm-{self._gz_seq}"
+        n = len(rows_cells)
+        sev = "fatal" if red else ""
+        cls = "gzip-table" + (" sev-fatal" if sev else "")
+        css = _html_escape(css_class or "")
+        self.parts.append(
+            f'<script type="application/gzip-json" id="{gid}">{b64}</script>'
+        )
+        self.parts.append(
+            f'<details class="{cls}" data-gz-src="{gid}" data-gz-css="{css}">'
+        )
+        if red:
+            self.parts.append(
+                f"<summary><span class=\"crit\"><strong>"
+                f"{_html_escape(summary_label)}</strong></span></summary>"
+            )
+        else:
+            self.parts.append(f"<summary>{_html_escape(summary_label)}</summary>")
+        self.parts.append(
+            f'<p class="note gzip-status">{n:,} rows stored as gzip(JSON); '
+            f"expand to decode.</p>"
+        )
+        self.parts.append('<div class="gzip-mount"></div>')
         self.parts.append("</details>")
 
     def i_code(self, s: str) -> str:
@@ -474,6 +621,10 @@ class MdRenderer(Renderer):
     ``_md_pipe_escape`` to avoid breaking the row.
     """
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.sidecars: List[Tuple[str, str]] = []
+
     @staticmethod
     def _md_pipe_escape(s: str) -> str:
         return s.replace("|", "\\|")
@@ -556,6 +707,38 @@ class MdRenderer(Renderer):
     def close_details(self) -> None:
         self.parts.append("</details>")
         self.parts.append("")
+
+    def gzip_fm_event_table(
+        self,
+        headers: List[str],
+        rows_cells: List[List[str]],
+        summary_label: str,
+        *,
+        red: bool = False,
+        css_class: Optional[str] = None,
+        sidecar_name: Optional[str] = None,
+    ) -> None:
+        if not rows_cells:
+            return
+        name = sidecar_name or "fm_unassigned.csv"
+        existing = {n for n, _ in self.sidecars}
+        if name in existing:
+            stem, ext = name.rsplit(".", 1) if "." in name else (name, "csv")
+            n = 2
+            while f"{stem}_{n}.{ext}" in existing:
+                n += 1
+            name = f"{stem}_{n}.{ext}"
+        buf = io.StringIO()
+        writer = csv.writer(buf, lineterminator="\n")
+        writer.writerow(headers)
+        writer.writerows(rows_cells)
+        self.sidecars.append((name, buf.getvalue()))
+        self.open_details(self.i_text(summary_label), red=red)
+        self.paragraph(
+            f"{len(rows_cells):,} rows written to {self.i_code(name)} "
+            f"(over the inline threshold; omitted from Markdown)."
+        )
+        self.close_details()
 
     def i_code(self, s: str) -> str:
         # Backticks inside the value would break the inline code span; the FM

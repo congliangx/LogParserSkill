@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from ..analyze.pipeline import NodeAnalysis
+from ..config import FM_UNASSIGNED_EMBED_THRESHOLD
 from .aggregates import (
     FmEventRow,
     FmFnmPortLossRow,
@@ -112,15 +113,37 @@ def _rack_is_anomalous(rack: RackMappingGroup) -> bool:
 # -----------------------------------------------------------------------------
 
 
+def _sidecar_slug(text: str) -> str:
+    chars = [
+        ch if ch.isalnum() or ch in "._-" else "_"
+        for ch in (text or "node")
+    ]
+    slug = "".join(chars).strip("._-") or "node"
+    return slug[:80]
+
+
 def _append_fm_event_table(
     r: Renderer,
     rows: List[FmEventRow],
     summary_label: str,
     *,
     omitted: int = 0,
+    gzip_embed: bool = False,
+    sidecar_name: Optional[str] = None,
 ) -> None:
     """Render FM events as a collapsed details block with a table inside."""
     if not rows and omitted <= 0:
+        return
+    if gzip_embed and rows:
+        cells = [_fm_event_row_cells(row) for row in rows]
+        r.gzip_fm_event_table(
+            FM_EVENT_TABLE_COLUMNS,
+            cells,
+            summary_label,
+            red=rows_have_nvl_fatal(rows),
+            css_class="tbl-fm-event",
+            sidecar_name=sidecar_name,
+        )
         return
     r.open_details(r.i_text(summary_label), red=rows_have_nvl_fatal(rows))
     if rows:
@@ -434,23 +457,30 @@ def _render_event_group_section(r: Renderer, ctx: Dict[str, Any]) -> None:
 def _render_fm_log_before_after_event_groups(
     r: Renderer, ctx: Dict[str, Any]
 ) -> None:
-    pre_cutoff = ctx.get("fm_log_pre_nvlsm_cutoff_ts") or ""
-    if pre_cutoff:
-        pre_label = (
-            f"Fabric Manager log before earliest NVLSM event "
-            f"(records before {pre_cutoff} have been omitted)"
-        )
-    else:
-        pre_label = "Fabric Manager log before earliest NVLSM event"
+    pre_label = "Fabric Manager log before earliest NVLSM event"
     outside_label = (
         "Fabric Manager log after earliest NVLSM event (outside event group windows)"
     )
-    _append_fm_event_table(r, ctx.get("fm_log_pre_nvlsm") or [], pre_label)
+    threshold = int(
+        ctx.get("fm_unassigned_embed_threshold") or FM_UNASSIGNED_EMBED_THRESHOLD
+    )
+    basename = str(ctx.get("report_basename") or "nmx_log_analysis")
+    slug = _sidecar_slug(str(ctx.get("label") or "node"))
+    pre_rows = ctx.get("fm_log_pre_nvlsm") or []
+    after_rows = ctx.get("fm_log_outside_after_nvlsm") or []
     _append_fm_event_table(
         r,
-        ctx.get("fm_log_outside_after_nvlsm") or [],
+        pre_rows,
+        pre_label,
+        gzip_embed=len(pre_rows) > threshold,
+        sidecar_name=f"{basename}_{slug}_fm_pre_nvlsm.csv",
+    )
+    _append_fm_event_table(
+        r,
+        after_rows,
         outside_label,
-        omitted=int(ctx.get("fm_log_outside_after_nvlsm_omitted") or 0),
+        gzip_embed=len(after_rows) > threshold,
+        sidecar_name=f"{basename}_{slug}_fm_after_nvlsm.csv",
     )
     if ctx.get("fm_log_no_timestamp"):
         r.paragraph(

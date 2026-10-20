@@ -50,8 +50,6 @@ class AnalysisBundle:
 
 def analyze_source(source: DumpSource, input_path: Path, cfg: AnalysisConfig) -> AnalysisBundle:
     bundle = AnalysisBundle(input_path=input_path, config=cfg)
-    unlimited_fm = cfg.fm_max_log_files == 0
-
     for idx, nmx_c in enumerate(source.nmx_c_roots()):
         label = nmx_c.name if len(source.nmx_c_roots()) == 1 else f"{nmx_c.parent.parent.parent.name}_{idx}"
         identity = load_node_identity(dump_root_from_nmx_c(nmx_c))
@@ -83,7 +81,7 @@ def analyze_source(source: DumpSource, input_path: Path, cfg: AnalysisConfig) ->
             forensics.parse_logs(nvlsm_logs, time_window=window)
             node.nvlsm_forensics = forensics.finalize()
 
-        fm_logs = collect_fabric_manager_logs(nmx_c, unlimited=unlimited_fm)
+        fm_logs = collect_fabric_manager_logs(nmx_c, max_files=cfg.fm_max_log_files)
         node.fm_files_parsed = len(fm_logs)
         all_events: List[Dict[str, Any]] = []
         for fp in fm_logs:

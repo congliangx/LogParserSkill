@@ -59,7 +59,7 @@ This skill consumes the *outputs* of the other two skills. If they have not been
 2. `nvos-tech-dump-tools-for-nmx-c` on the NVOS dump(s) → `<dump>.md`.
 3. This skill, on those two report sets.
 
-**Pass a time window into step 2.** Unfiltered NVOS dumps are often weeks of Fabric Manager history; the NVOS report then drops the oldest pre-NVLSM FM rows (display cap 1200), and this skill cannot correlate early compute-tray Xids to switch-side evidence that never made the report.
+**Pass a time window into step 2.** Unfiltered NVOS dumps are often weeks of Fabric Manager history. Unassigned FM tables over `FM_UNASSIGNED_EMBED_THRESHOLD` (1200) rows are gzip-embedded in HTML and moved to CSV in Markdown, which this skill does not read; a window around the incident keeps those tables inline in the NVOS Markdown so early compute-tray Xids can still join to switch-side evidence.
 
 Do **not** write extra Python to extract the window. Follow `nvos-tech-dump-tools-for-nmx-c/SKILL.md` **Optional `--since` / `--until`** exactly: read the nv-bug-report Markdown (prefer `cross-node-report.md` §4, else per-node §7.3 / §6), take min/max event-group calendar dates, expand one day on each side, pass `--since YYYY-MM-DD --until YYYY-MM-DD`. Print the window in chat, then run the NVOS CLI. Honour a user-supplied window. If there are no Xid and no IMEX event groups, run NVOS unfiltered and say so. Do not apply a timezone offset when building these flags — that is Step 3 of *this* skill, after both reports exist.
 
