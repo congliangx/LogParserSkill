@@ -250,48 +250,6 @@ def _normalize_gpu_guid(value: str) -> str:
         return key
 
 
-def _extract_message_type(message: str) -> str:
-    """
-    Extract message type from FM error message.
-    
-    Extracts text between "detected" and "error on" from messages like:
-    "Fabric Manager detected GPU NVL Fatal error on :"
-    "Fabric Manager detected stale GPU NVL Non Fatal error on :"
-    
-    Returns the message type (e.g., "GPU NVL Fatal", "stale GPU NVL Non Fatal")
-    or empty string if pattern not found.
-    """
-    if not message:
-        return ''
-    
-    # Pattern: "detected <message_type> error on"
-    # Case-insensitive search
-    msg_lower = message.lower()
-    detected_idx = msg_lower.find('detected')
-    if detected_idx == -1:
-        return ''
-    
-    error_on_idx = msg_lower.find('error on', detected_idx)
-    if error_on_idx == -1:
-        return ''
-    
-    start = detected_idx + len('detected')
-    end = error_on_idx
-    message_type = message[start:end].strip()
-
-    # Shorten: "GPU NVL Fatal" -> "Fatal", "stale GPU NVL Fatal" -> "Stale Fatal"
-    shortened = message_type
-    is_stale = shortened.lower().startswith('stale ')
-    if is_stale:
-        shortened = shortened[6:]
-    if shortened.lower().startswith('gpu nvl '):
-        shortened = shortened[8:]
-    if is_stale:
-        shortened = f"Stale {shortened}"
-
-    return shortened or message_type
-
-
 def _parse_fabric_manager_log(
     lines: Iterable[str],
     *,

@@ -26,8 +26,7 @@ def normalize_arc_path(name: str) -> str:
 def scan_tar_nmx_layout(tar_path: Union[str, Path]) -> Tuple[bool, List[str]]:
     """Single pass over tarball members: returns (has_log_nmx, sorted_nmx_c_prefixes).
 
-    Replaces the two-pass combination of ``tar_has_log_nmx`` + ``tar_nmx_c_prefixes``
-    so a multi-GB ``.tar.gz`` is gunzipped only once for layout detection.
+    A multi-GB ``.tar.gz`` is gunzipped only once for layout detection.
     """
     has_nmx = False
     prefixes: Set[str] = set()
@@ -41,18 +40,6 @@ def scan_tar_nmx_layout(tar_path: Union[str, Path]) -> Tuple[bool, List[str]]:
             if idx >= 0:
                 prefixes.add(p[: idx + len(NMX_C_SEGMENT)])
     return has_nmx, sorted(prefixes)
-
-
-def tar_has_log_nmx(tar_path: Union[str, Path]) -> bool:
-    """Scan tarball member names only (no extract) for log/nmx."""
-    has_nmx, _ = scan_tar_nmx_layout(tar_path)
-    return has_nmx
-
-
-def tar_nmx_c_prefixes(tar_path: Union[str, Path]) -> List[str]:
-    """Return archive path prefixes ending at log/nmx/nmx-c (for extract)."""
-    _, prefixes = scan_tar_nmx_layout(tar_path)
-    return prefixes
 
 
 def dir_has_log_nmx(path: Path) -> bool:
@@ -103,7 +90,13 @@ def collect_nvlsm_log_files(nmx_c: Path) -> List[Path]:
     )
 
 
-def collect_fabric_manager_logs(nmx_c: Path, unlimited: bool = True) -> List[Path]:
+def collect_fabric_manager_logs(nmx_c: Path, max_files: int = 0) -> List[Path]:
+    """Collect Fabric Manager logs under ``nmx-c``.
+
+    ``max_files`` 0 (or negative) keeps every matching file. A positive N
+    keeps the N newest: current ``fabricmanager.log`` first, then
+    ``fabricmanager.log.1``, ``.2``, …
+    """
     def sort_key(p: Path) -> tuple:
         name = p.name.lower()
         if name in ("fabricmanager.log", "fabricmanager.log.gz"):
@@ -118,8 +111,8 @@ def collect_fabric_manager_logs(nmx_c: Path, unlimited: bool = True) -> List[Pat
         if p.is_file() and re.match(r"^fabricmanager\.log", p.name, re.I)
     ]
     files = sorted(files, key=sort_key)
-    if not unlimited and len(files) > 3:
-        files = files[:3]
+    if max_files > 0:
+        files = files[:max_files]
     return files
 
 

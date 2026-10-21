@@ -5,6 +5,12 @@ from typing import Optional
 
 from .time_range import TimeWindow
 
+# Per-table row count that switches the two unassigned FM tables
+# (pre-NVLSM; after-NVLSM outside event groups) from inline HTML/Markdown
+# to gzip-in-HTML plus a Markdown sidecar CSV. Not a drop-cap: every row
+# is still kept. Each table is judged independently.
+FM_UNASSIGNED_EMBED_THRESHOLD = 1200
+
 
 @dataclass
 class AnalysisConfig:
@@ -15,7 +21,7 @@ class AnalysisConfig:
     time_window: Optional[TimeWindow] = None
 
     # Fabric Manager: no file cap, no age cutoff (equivalent to -vvv)
-    fm_max_log_files: int = 0  # 0 = unlimited
+    fm_max_log_files: int = 0  # 0 = unlimited; N > 0 = newest N files
     fm_max_age_days: int = 0  # 0 = disabled
     fm_verbosity: int = 3  # emit all health polls
 
@@ -34,3 +40,5 @@ class AnalysisConfig:
 
     # Report
     report_basename: str = "nmx_log_analysis"
+
+    fm_unassigned_embed_threshold: int = FM_UNASSIGNED_EMBED_THRESHOLD

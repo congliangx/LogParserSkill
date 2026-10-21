@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..analyze.pipeline import NodeAnalysis
+from ..config import FM_UNASSIGNED_EMBED_THRESHOLD
 from ..event_grouping.adaptive import (
     parse_ts,
     port_events_for_event_group_report,
@@ -643,7 +644,6 @@ def collect_fnm_port_loss_report(
 
 
 FM_LOGS_MAX_PER_EVENT_GROUP = 600
-FM_LOGS_MAX_UNASSIGNED = 1200
 
 # Levels filtered out of the per-event-group FM event table (user requirement: drop INFO).
 FM_EVENT_DROP_LEVELS: Tuple[str, ...] = ("INFO",)
@@ -1235,13 +1235,11 @@ def attach_fm_event_rows_to_nvlsm_event_groups(
     node_id_lookup: NodeIdLookup,
     *,
     max_per_event_group: int = FM_LOGS_MAX_PER_EVENT_GROUP,
-    max_unassigned: int = FM_LOGS_MAX_UNASSIGNED,
 ) -> Dict[str, Any]:
     """Bucket FM events (post INFO filter) as structured rows under NVLSM event-group windows."""
     buckets: List[List[FmEventRow]] = [[] for _ in event_groups]
     omitted_per_event_group = [0 for _ in event_groups]
     unassigned: List[FmEventRow] = []
-    unassigned_omitted = 0
     no_ts = 0
 
     sorted_events = sorted(
@@ -1285,7 +1283,6 @@ def attach_fm_event_rows_to_nvlsm_event_groups(
 
     return {
         "unassigned": unassigned,
-        "unassigned_omitted": unassigned_omitted,
         "no_timestamp": no_ts,
     }
 
@@ -1297,6 +1294,8 @@ def build_node_report_context(
     fm_fnm_nvlsm_match_window_seconds: int = 300,
     fm_fnm_init_follow_gap_seconds: int = 600,
     lifecycle_pair_max_seconds: int = 120,
+    report_basename: str = "nmx_log_analysis",
+    fm_unassigned_embed_threshold: int = FM_UNASSIGNED_EMBED_THRESHOLD,
 ) -> Dict[str, Any]:
     """Precompute all aggregated sections for one node."""
     nvlsm_event_groups = aggregate_nvlsm_event_group_details(
@@ -1325,8 +1324,8 @@ def build_node_report_context(
         if dt is not None and (earliest_nvlsm_dt is None or dt < earliest_nvlsm_dt):
             earliest_nvlsm_dt = dt
 
-    pre_nvlsm_all: List[Any] = []
-    outside_after_nvlsm_all: List[Any] = []
+    pre_nvlsm: List[Any] = []
+    outside_after_nvlsm: List[Any] = []
     for row in fm_event_placement.get("unassigned") or []:
         row_dt = parse_ts(getattr(row, "ts", "") or "")
         if (
@@ -1334,21 +1333,9 @@ def build_node_report_context(
             and row_dt is not None
             and row_dt < earliest_nvlsm_dt
         ):
-            pre_nvlsm_all.append(row)
+            pre_nvlsm.append(row)
         else:
-            outside_after_nvlsm_all.append(row)
-
-    pre_cap = FM_LOGS_MAX_UNASSIGNED
-    after_cap = FM_LOGS_MAX_UNASSIGNED
-    # Keep the *tail* of the pre-NVLSM bucket: events closest to the first
-    # NVLSM observation are far more informative than the historical leading
-    # edge, so when we drop, we drop from the oldest end.
-    pre_nvlsm = pre_nvlsm_all[-pre_cap:] if pre_nvlsm_all else []
-    pre_nvlsm_cutoff_ts = (
-        pre_nvlsm[0].ts if len(pre_nvlsm_all) > pre_cap and pre_nvlsm else ""
-    )
-    outside_after_nvlsm = outside_after_nvlsm_all[:after_cap]
-    outside_after_nvlsm_omitted = max(0, len(outside_after_nvlsm_all) - after_cap)
+            outside_after_nvlsm.append(row)
 
     non_fnm_port_event_count = 0
     if node.nvlsm_health and node.nvlsm_health.port_events:
@@ -1367,9 +1354,9 @@ def build_node_report_context(
         "gpu_mapping_slots": slot_groups,
         "gpu_mapping_racks": group_slots_by_rack(slot_groups),
         "fm_log_pre_nvlsm": pre_nvlsm,
-        "fm_log_pre_nvlsm_cutoff_ts": pre_nvlsm_cutoff_ts,
         "fm_log_outside_after_nvlsm": outside_after_nvlsm,
-        "fm_log_outside_after_nvlsm_omitted": outside_after_nvlsm_omitted,
+        "report_basename": report_basename,
+        "fm_unassigned_embed_threshold": fm_unassigned_embed_threshold,
         "earliest_nvlsm_ts": (
             earliest_nvlsm_dt.strftime("%Y-%m-%d %H:%M:%S")
             if earliest_nvlsm_dt is not None

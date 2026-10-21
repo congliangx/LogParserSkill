@@ -65,10 +65,11 @@ Arguments:
 - `--since` / `--start-time` (optional): keep records at or after this time (`YYYY-MM-DD` or `YYYY-MM-DD HH:MM[:SS]`). Date-only is `00:00:00`.
 - `--until` / `--end-time` (optional): keep records at or before this time. Date-only includes that entire day.
 
-Outputs two files in the output directory:
+Writes these files in the output directory:
 
 - `<name>.md` — Markdown report.
 - `<name>.html` — self-contained HTML report (same content; the better viewer for wide aggregated tables).
+- `<name>_<node>_fm_pre_nvlsm.csv` / `<name>_<node>_fm_after_nvlsm.csv` — only when that unassigned FM table exceeds `FM_UNASSIGNED_EMBED_THRESHOLD` (1200). Those rows are omitted from Markdown; HTML gzip-embeds them.
 
 Example:
 
@@ -77,7 +78,7 @@ Example:
 # writes /path/to/reports/rack3_nmxc.md and /path/to/reports/rack3_nmxc.html
 ```
 
-`main.py` prints the number of `log/nmx/nmx-c` root(s) found, the chosen log time range when one was passed, and the two output paths; any non-fatal parse issues are listed as `Warnings:` on stderr while the report is still written.
+`main.py` prints the number of `log/nmx/nmx-c` root(s) found, the chosen log time range when one was passed, and each output path; any non-fatal parse issues are listed as `Warnings:` on stderr while the report is still written.
 
 #### Optional `--since` / `--until` (do this before `correlation-xid`)
 
@@ -85,7 +86,12 @@ These flags filter **every** NVLSM and Fabric Manager record *before* grouping, 
 
 The filter is whole-report, not per-section. When a window is set, both Markdown and HTML put a **Log coverage** line at the top of the document (`This analysis only covers related logs from …`). Do not bury an equivalent note inside a single node section.
 
-Without a window, a large dump still hits the report's display cap (`FM_LOGS_MAX_UNASSIGNED = 1200`): Fabric Manager rows *before the earliest NVLSM event group* keep only the **tail**, so early compute-tray Xids often have no matching switch-side rows for `correlation-xid`. Passing a window around the incident is the supported way to keep those early records in the report.
+`FM_UNASSIGNED_EMBED_THRESHOLD` (`AnalysisConfig.fm_unassigned_embed_threshold`, default 1200) is a per-table **inline-vs-embed threshold** for the two unassigned Fabric Manager tables (before earliest NVLSM event; after earliest NVLSM event but outside event-group windows), judged independently. It is not a drop-cap; rows are never omitted.
+
+- At or below 1200 rows: inline in HTML (so the report search box works) and in Markdown.
+- Above 1200 rows: HTML stores gzip(JSON)+base64 and lazy-decodes on expand; Markdown writes a sibling `.csv` and only a pointer in the `.md`.
+
+Passing a `--since` / `--until` window around the incident is still the way to keep a large dump focused so `correlation-xid` can read those FM rows from Markdown (it does not consume the CSV sidecars).
 
 Build `--since` / `--until` with this single procedure. Do **not** add scripts; do **not** convert hours or apply a timezone offset here (`correlation-xid` is what aligns the two clocks later).
 

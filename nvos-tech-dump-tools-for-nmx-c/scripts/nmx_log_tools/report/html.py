@@ -491,6 +491,9 @@ details.sev-fatal > summary::before { border-color: var(--fatal); }
 details.sev-warn { border-left-color: var(--warn); }
 details.sev-warn > summary::before { border-color: var(--warn); }
 
+details.gzip-table .gzip-status { margin: 0.4em 0 0.2em; }
+details.gzip-table .gzip-mount { margin: 0.4em 0 0; }
+
 /* ---------------- search hidden rows ---------------- */
 tr.search-hidden { display: none; }
 
@@ -536,6 +539,8 @@ def render_html(bundle: AnalysisBundle) -> str:
             fm_fnm_nvlsm_match_window_seconds=cfg.fm_fnm_nvlsm_match_window_seconds,
             fm_fnm_init_follow_gap_seconds=cfg.fm_fnm_init_follow_gap_seconds,
             lifecycle_pair_max_seconds=cfg.nvlsm_event_group_max_seconds,
+            report_basename=cfg.report_basename,
+            fm_unassigned_embed_threshold=cfg.fm_unassigned_embed_threshold,
         )
         render_node(r, node, ctx)
 

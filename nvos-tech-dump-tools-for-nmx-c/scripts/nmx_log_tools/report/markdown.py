@@ -6,13 +6,16 @@ the Markdown-specific document header.
 
 from __future__ import annotations
 
+from typing import List, Tuple
+
 from ..analyze.pipeline import AnalysisBundle
 from .aggregates import build_node_report_context
 from .node_view import render_node
 from .renderer import MdRenderer
 
 
-def render_markdown(bundle: AnalysisBundle) -> str:
+def render_markdown(bundle: AnalysisBundle) -> Tuple[str, List[Tuple[str, str]]]:
+    """Return Markdown text plus any sidecar files ``(filename, content)``."""
     r = MdRenderer()
     r.heading(1, "NMX-C Log Analysis Report")
     bullets = [f"{r.i_bold('Input:')} {r.i_code(str(bundle.input_path))}"]
@@ -35,7 +38,9 @@ def render_markdown(bundle: AnalysisBundle) -> str:
             fm_fnm_nvlsm_match_window_seconds=cfg.fm_fnm_nvlsm_match_window_seconds,
             fm_fnm_init_follow_gap_seconds=cfg.fm_fnm_init_follow_gap_seconds,
             lifecycle_pair_max_seconds=cfg.nvlsm_event_group_max_seconds,
+            report_basename=cfg.report_basename,
+            fm_unassigned_embed_threshold=cfg.fm_unassigned_embed_threshold,
         )
         render_node(r, node, ctx)
 
-    return r.render()
+    return r.render(), list(r.sidecars)
